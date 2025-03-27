@@ -1,0 +1,406 @@
+---
+title: "Maxent_Models_forloop"
+output: html_document
+date: "2025-03-26"
+Authors: Cindy Hurtado, Siobhan Darlington
+---
+
+Corrected mapping code re-written as a forloop to generate distribution maps across all species
+
+Recommendation: Incorporate additional environmental covariates such as elevation, aspect, roads? 
+Assign environmental covariates specific to each species within the forloop.
+
+```{r}
+library(spocc)
+library(spThin)
+library(dismo)
+library(sf)
+library(ENMeval)
+library(wallace)
+library(mapview)
+library(rnaturalearth)
+```
+Revised forloop that doesn't require pulling the same environmental data every single time.
+```{r}
+# Define file path
+occs_path <- "C:/LocalR/SDM_mesocarnivores/data"
+occs_path <- file.path(occs_path, "wallace_data_March252025.csv")
+
+# Get a list of species occurrence data
+userOccs_Cl <- occs_userOccs(
+  txtPath = occs_path, 
+  txtName = occs_file, 
+  txtSep = ",", 
+  txtDec = "."
+)
+
+# Define environmental variables
+env_vars <- c('bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08', 
+              'bio09', 'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 
+              'bio17', 'bio18', 'bio19')
+
+# Environmental data for western BC
+envs_west <- envs_worldclim(
+  bcRes = 0.5,
+  bcSel = env_vars, 
+  mapCntr = c(-120.511, 53.347),  # Adjust for western BC
+  doBrick = TRUE
+)
+
+# Environmental data for eastern BC
+envs_east <- envs_worldclim(
+  bcRes = 0.5,
+  bcSel = env_vars, 
+  mapCntr = c(-114.511, 53.347),  # Adjust for eastern BC
+  doBrick = TRUE
+)
+
+# Merge environmental data
+envs_Cl <- merge(envs_west, envs_east)
+
+# Storage list for results
+species_results <- list()
+
+# Loop through all species
+for (species in names(userOccs_Cl)) {
+  message("Processing: ", species)  # Show progress
+
+  # Extract cleaned occurrence data
+  occs_Cl <- userOccs_Cl[[species]]$cleaned
+  
+  # Skip species with no cleaned data
+  if (nrow(occs_Cl) == 0) next
+
+  # Extract environmental values for occurrences
+  occs_xy_Cl <- occs_Cl[, c('longitude', 'latitude')]
+  occs_vals_Cl <- as.data.frame(raster::extract(envs_Cl, occs_xy_Cl, cellnumbers = TRUE))
+
+  # Remove duplicated same cell values
+  occs_Cl <- occs_Cl[!duplicated(occs_vals_Cl[, 1]), ]
+  occs_vals_Cl <- occs_vals_Cl[!duplicated(occs_vals_Cl[, 1]), -1]
+
+  # Remove records with NA environmental values
+  occs_Cl <- occs_Cl[!(rowSums(is.na(occs_vals_Cl)) >= 1), ]
+  occs_vals_Cl <- na.omit(occs_vals_Cl)
+
+  # Combine occurrences with environmental values
+  occs_Cl <- cbind(occs_Cl, occs_vals_Cl)
+
+  # Load BC boundary (this will be the same for each species)
+  bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>% 
+    dplyr::filter(name == "British Columbia")
+
+  # Mask environmental data (this step is the same for each species)
+  bgMask_Cl <- penvs_bgMask(
+    occs = occs_Cl,
+    envs = envs_Cl,
+    bgExt = bc_boundary
+  )
+
+  # Sample background points (this step is the same for each species)
+  bgSample_Cl <- penvs_bgSample(
+    occs = occs_Cl,
+    bgMask = bgMask_Cl,
+    bgPtsNum = 10000
+  )
+
+  # Partition occurrence data (this step is the same for each species)
+  groups_Cl <- part_partitionOccs(
+    occs = occs_Cl,
+    bg = bgSample_Cl,
+    method = "block",
+    bgMask = bgMask_Cl,
+    aggFact = 2
+  )
+
+  # Extract background environmental values
+  bgEnvsVals_Cl <- as.data.frame(raster::extract(bgMask_Cl, bgSample_Cl))
+  bgEnvsVals_Cl <- cbind(scientific_name = paste0("bg_", species), bgSample_Cl,
+                         occID = NA, year = NA, institution_code = NA, country = NA,
+                         state_province = NA, locality = NA, elevation = NA,
+                         record_type = NA, bgEnvsVals_Cl)
+
+  # Store results for this species
+  species_results[[species]] <- list(
+    occurrences = occs_Cl,
+    background = bgEnvsVals_Cl,
+    partitions = groups_Cl
+  )
+}
+
+# Print summary of results
+print(lapply(species_results, function(x) nrow(x$occurrences)))
+
+
+```
+
+## Exclude species with low sample sizes:
+```{r}
+# Create an empty dataframe to store results
+species_sample_sizes <- data.frame(Species = character(), 
+                                   OrigSampleSize = integer(), 
+                                   CleanedSampleSize = integer(), 
+                                   stringsAsFactors = FALSE)
+
+# Loop through userOccs_Cl and extract sample sizes
+for (species_name in names(userOccs_Cl)) {
+  orig_df <- userOccs_Cl[[species_name]]$orig      # Access the original dataframe
+  cleaned_df <- userOccs_Cl[[species_name]]$cleaned  # Access the cleaned dataframe
+  
+  orig_size <- nrow(orig_df)     # Count number of rows in orig
+  cleaned_size <- nrow(cleaned_df)  # Count number of rows in cleaned
+  
+  # Append to results dataframe
+  species_sample_sizes <- rbind(species_sample_sizes, 
+                                data.frame(Species = species_name, 
+                                           OrigSampleSize = orig_size, 
+                                           CleanedSampleSize = cleaned_size))
+}
+
+# View the final dataframe
+print(species_sample_sizes)
+
+### Urocyon_cineroargenteus, Erethizon_dorsatum, Spilogale_gracilis =< cleaned 22 obs
+
+## Also subset out the species that did run correctly, for this test run:
+
+# List of species to exclude
+exclude_species <- c("Urocyon_cinereoargenteus","Erethizon_dorsatum", "Spilogale_gracilis")
+# 
+# "Taxidea_taxus", "Lynx_rufus", "Vulpes_vulpes","Tamiasciurus_hudsonicus", "Lynx_canadensis", "Pekania_pennanti", "Glaucomys_sabrinus", "Mustela_erminea", "Tamiasciurus_hudsonicus", "Neogale_vison", "Martes_americana", "Canis_latrans"
+
+# Filter out species
+filtered_species <- setdiff(names(species_results), exclude_species)
+
+```
+
+
+
+
+#run through model forloop
+```{r}
+library(raster)
+
+# Storage list for model results
+species_models <- list()
+
+# Loop through each species
+for (species in names(species_results)[!(names(species_results) %in% exclude_species)]) {
+  message("Processing: ", species)  # Show progress
+
+  # Extract data for the species
+  occs_Cl <- species_results[[species]]$occurrences
+  bgEnvsVals_Cl <- species_results[[species]]$background
+  groups_Cl <- species_results[[species]]$partitions
+
+  # 🚨 Check if occurrence data exists
+  if (is.null(occs_Cl) || nrow(occs_Cl) == 0) {
+    message("⚠ Skipping ", species, " due to missing occurrences")
+    next
+  }
+
+  # Load BC boundary (ensure it works)
+  bc_boundary <- tryCatch(
+    ne_states(country = "Canada", returnclass = "sf") %>% 
+      dplyr::filter(name == "British Columbia"),
+    error = function(e) NULL
+  )
+
+  if (is.null(bc_boundary)) {
+    message("⚠ Skipping ", species, " because BC boundary could not be loaded")
+    next
+  }
+
+  # 🚨 Check if environmental layers exist
+  if (!exists("envs_Cl") || is.null(envs_Cl) || !is(envs_Cl, "RasterBrick")) {
+    message("⚠ Skipping ", species, " due to missing environmental layers")
+    next
+  }
+
+  # Generate background mask
+  bgMask_Cl <- tryCatch(
+    penvs_bgMask(
+      occs = occs_Cl,
+      envs = envs_Cl,
+      bgExt = bc_boundary
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(bgMask_Cl)) {
+    message("⚠ Skipping ", species, " because bgMask_Cl is NULL")
+    next
+  }
+
+  # Sample background points
+  bgSample_Cl <- penvs_bgSample(
+    occs = occs_Cl,
+    bgMask = bgMask_Cl,
+    bgPtsNum = 10000
+  )
+
+  # Check if background points exist
+  if (is.null(bgSample_Cl) || nrow(bgSample_Cl) == 0) {
+    message("⚠ Skipping ", species, " due to missing background points")
+    next
+  }
+
+  # ✅ Run MaxEnt model
+  model_Cl <- model_maxent(
+    occs = occs_Cl,
+    bg = bgEnvsVals_Cl,
+    user.grp = groups_Cl, 
+    bgMsk = bgMask_Cl,
+    rms = c(1, 2), 
+    rmsStep = 1,
+    fcs = 'L',
+    clampSel = FALSE,
+    algMaxent = "maxnet",
+    parallel = FALSE,
+    numCores = 27
+  )
+
+  # Store model results
+  species_models[[species]] <- model_Cl
+}
+
+# Print summary of models
+print(lapply(species_models, class))
+
+```
+
+
+Forloop through mapping each species distribution
+```{r}
+# Load necessary libraries
+library(leaflet)
+library(webshot)
+library(htmlwidgets)
+library(raster)
+
+# Ensure webshot is installed
+# webshot::install_phantomjs()
+
+# Create output directory if it doesn't exist
+if (!dir.exists("species_maps")) {
+  dir.create("species_maps")
+}
+
+# Loop through all species
+for (species in names(species_models)) {
+  message("Creating map for: ", species)  # Show progress
+
+  # Retrieve model and environmental data
+  occs_Cl <- species_results[[species]]$occurrences
+  # bgMask_Cl <- species_results[[species]]$background
+  model_Cl <- species_models[[species]]  # Use the model from previous for-loop
+
+
+  # Select MaxEnt model safely
+  m_Cl <- tryCatch(model_Cl@models[["fc.L_rm.1"]], error = function(e) NULL)
+
+    # Get prediction for the species using the model
+  predSel_Cl <- tryCatch(
+    predictMaxnet(m_Cl, bgMask_Cl, type = "logistic", clamp = FALSE),
+    error = function(e) NULL
+  )
+  
+
+  # Get values of prediction (ensure valid raster before proceeding)
+  mapPredVals_Cl <- tryCatch(getValues(predSel_Cl), error = function(e) NULL)
+   
+  # Define colors and legend  
+  rasCols <- c("#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c")  # Blue to Red
+  legendPal <- colorNumeric(rasCols, mapPredVals_Cl, na.color = 'transparent')  
+  rasPal <- colorNumeric(rasCols, mapPredVals_Cl, na.color = 'transparent')
+
+  # Define specific legend values (ensuring they match the prediction range)
+  legendValues <- seq(min(mapPredVals_Cl, na.rm = TRUE), max(mapPredVals_Cl, na.rm = TRUE), length.out = 5)
+
+  # Generate the map using leaflet
+  m <- leaflet() %>%
+    addProviderTiles(providers$Esri.WorldTopoMap)
+
+  m2 <- m %>%
+    leaflet::addLegend("bottomright", pal = legendPal,
+                       title = "Predicted Suitability",
+                       values = rev(legendValues),  
+                       labFormat = labelFormat(
+                         suffix = "",  
+                         prefix = "",  
+                         between = " - "  
+                       )) %>%
+    # Add occurrence data
+    addCircleMarkers(data = occs_Cl, lat = ~latitude, lng = ~longitude,
+                     radius = 5, color = 'red', fill = TRUE, fillColor = "red",
+                     fillOpacity = 0.2, weight = 2, popup = ~species) %>% 
+    ## Add model prediction
+    addRasterImage(predSel_Cl, colors = rasPal, opacity = 0.9,
+                   group = 'vis', layerId = 'mapPred', method = "ngb")
+
+  # Save the map to an HTML file
+  map_filename <- paste0("species_maps/", species, "_map.html")
+  saveWidget(m2, map_filename, selfcontained = TRUE)
+
+  # Optionally, view the map in the RStudio Viewer
+  print(m2)
+}
+
+
+```
+
+Export rasters in a forloop
+
+```{r}
+# Load necessary libraries
+library(raster)
+library(leaflet)
+
+# Define the output directory for saving rasters
+output_dir <- "C:/LocalR/SDM_mesocarnivores/Output_species_maps"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Loop through species results and create/export rasters
+for (species in names(species_results)) {
+  message("Generating raster for: ", species)
+
+  # Retrieve occurrence, background, and partition data
+  occs_Cl <- species_results[[species]]$occurrences
+  bgEnvsVals_Cl <- species_results[[species]]$background
+  groups_Cl <- species_results[[species]]$partitions
+
+  # Skip if no occurrences exist
+  if (nrow(occs_Cl) == 0) next
+
+  # Train the MaxEnt model
+  model_Cl <- model_maxent(
+    occs = occs_Cl,
+    bg = bgEnvsVals_Cl,
+    user.grp = groups_Cl, 
+    bgMsk = bgMask_Cl,
+    rms = c(1, 2), 
+    rmsStep = 1,
+    fcs = 'L',
+    clampSel = FALSE,
+    algMaxent = "maxnet",
+    parallel = FALSE,
+    numCores = 27
+  )
+
+  # Extract model and predict suitability
+  m_Cl <- model_Cl@models[["fc.L_rm.1"]]
+  predSel_Cl <- predictMaxnet(m_Cl, bgMask_Cl, type = "logistic", clamp = FALSE)
+
+  # Define file path for raster export
+  raster_filename <- file.path(output_dir, paste0(species, "_suitability.tif"))
+
+  # Save the raster to file
+  writeRaster(predSel_Cl, filename = raster_filename, format = "GTiff", overwrite = TRUE)
+
+  message("Saved raster: ", raster_filename)
+}
+
+message("All rasters exported successfully!")
+
+```
+
