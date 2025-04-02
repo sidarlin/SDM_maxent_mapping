@@ -2,8 +2,12 @@
 title: "Maxent_Models_forloop"
 output: html_document
 date: "2025-03-26"
-Authors: Cindy Hurtado, Siobhan Darlington
+Authors: Initial Wallace Output run by Cindy Hurtado, R code modified by Siobhan Darlington
 ---
+
+Cindy: Ran initial test of coyote, recommends running individual models customized to each species. 
+
+Siobhan: recommends forloop through spatial layer extractions and generating points, customize models by species at later steps and forloop through creating maps. 
 
 Corrected mapping code re-written as a forloop to generate distribution maps across all species
 
@@ -19,12 +23,31 @@ library(ENMeval)
 library(wallace)
 library(mapview)
 library(rnaturalearth)
+library(raster)
+library(terra)   # Replaces raster for modern spatial handling
+library(geodata) # New package for WorldClim downloads
+library(parallel)
+library(leaflet)
+library(webshot)
+library(htmlwidgets)
+library(raster)
 ```
-Revised forloop that doesn't require pulling the same environmental data every single time.
+
+I am using the presence-only output from the Merge_datacollation_2025.Rmd containing camera detections, incidentals, DNA, trapper data, and museum records. 
+
+I have further removed subspecies names and excluded records earlier than 2000 and records outside of BC borders
+
+Load species data from your cleaned Wallace Csv with three columns:
+-species_scientific, species scientific names, no subspecies and no "sp" undefined species
+-latitude,in decimal degrees
+-longitude, in decimal degrees
+
+*Note that duplicate locations will be removed at a later step, if you forgot to clean the file beforehand
+
 ```{r}
 # Define file path
 occs_path <- "C:/LocalR/SDM_mesocarnivores/data"
-occs_path <- file.path(occs_path, "wallace_data_March252025.csv")
+occs_path <- file.path(occs_path, "wallace_data_March282025.csv")
 
 # Get a list of species occurrence data
 userOccs_Cl <- occs_userOccs(
@@ -33,16 +56,122 @@ userOccs_Cl <- occs_userOccs(
   txtSep = ",", 
   txtDec = "."
 )
+```
 
-# Define environmental variables
-env_vars <- c('bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08', 
-              'bio09', 'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 
+Revised forloop that doesn't require pulling the same environmental data every single time.
+Adding other environmental layers
+- Elevation (tif)
+- BC BEC Zones (16 in a shapefile)
+- Canopy height NASA
+- Distance to water?
+```{r}
+# Define file paths
+elevation_path <- "C:/LocalR/SDM_mesocarnivores/GIS/wc2.1_30s_elev.tif"
+canopy_height_path <- "C:/LocalR/SDM_mesocarnivores/GIS/canopy_height.tif"
+bec_zones_path <- "C:/LocalR/SDM_mesocarnivores/GIS/PSPCTBGCZN_polygon.shp"
+bc_boundary_path <- "C:/LocalR/SDM_mesocarnivores/GIS/BC_Polygon.shp"
+
+# Load BC boundary shapefile
+bc_boundary <- st_read(bc_boundary_path) %>% st_transform(crs = st_crs(4326))
+
+# Load raster layers
+elevation <- rast(elevation_path)
+canopy_height <- rast(canopy_height_path)
+
+
+# Ensure CRS consistency
+elevation <- project(elevation, "EPSG:4326")
+canopy_height <- project(canopy_height, "EPSG:4326")
+
+# Crop and mask rasters to BC boundary
+elevation <- crop(elevation, vect(bc_boundary)) %>% mask(vect(bc_boundary))
+canopy_height <- crop(canopy_height, vect(bc_boundary)) %>% mask(vect(bc_boundary))
+
+# Load BEC zones and ensure CRS matches
+bec_zones <- st_read(bec_zones_path) %>% st_transform(crs = st_crs(4326))
+ 
+# Convert ZONE_NAME to numeric IDs (ensure it's a factor and then numeric)
+bec_zones$ZONE_ID <- as.numeric(factor(bec_zones$ZONE_NAME))
+
+# Check the unique BEC zone IDs
+summary(bec_zones$ZONE_ID)
+table(bec_zones$ZONE_ID)  # This shows how many records belong to each zone
+
+# Load the raster that will serve as the template (elevation)
+elevation <- rast(elevation_path)
+
+# Ensure CRS consistency between the BEC zones and the elevation raster
+bec_zones <- st_transform(bec_zones, crs = crs(elevation))
+# Create an empty list to store BEC zone layers
+bec_list <- list()
+
+# Loop through each unique BEC zone and create a binary raster for it
+for (zone_id in unique(bec_zones$ZONE_ID)) {
+  
+  # Create a binary raster where the current zone ID is 1 and all others are 0
+  bec_binary_raster <- rasterize(vect(bec_zones[bec_zones$ZONE_ID == zone_id, ]), elevation, 
+                                 field = "ZONE_ID", background = 0)
+  
+  # Assign 1 to cells where the current zone ID is present
+  bec_binary_raster[bec_binary_raster == zone_id] <- 1
+  
+  # Name the binary raster layer (e.g., "BEC_Zone_1")
+  names(bec_binary_raster) <- paste0("BEC_Zone_", zone_id)
+  
+  # Add the raster to the list
+  bec_list[[paste0("BEC_Zone_", zone_id)]] <- bec_binary_raster
+}
+
+# Convert list of BEC zone rasters into a SpatRaster stack
+bec_stack <- rast(bec_list)
+
+# Ensure CRS is consistent across all rasters
+elevation <- project(elevation, crs(bec_stack))
+canopy_height <- project(canopy_height, crs(bec_stack))
+
+# Resample canopy height to match BEC stack and elevation (assuming they are at the desired resolution)
+canopy_height_resampled <- resample(canopy_height, bec_stack, method = "bilinear")
+
+# Align extents using canopy_height as the reference
+elevation <- crop(elevation, canopy_height_resampled)
+bec_stack <- crop(bec_stack, canopy_height_resampled)
+
+# Verify alignment
+if (!all.equal(ext(elevation), ext(canopy_height_resampled)) || 
+    !all.equal(ext(bec_stack), ext(canopy_height_resampled))) {
+  stop("Extents do not match after cropping!")
+}
+
+# Final stack of environmental variables
+envs_Cl <- c(elevation, canopy_height_resampled, bec_stack)
+
+
+# Convert to RasterStack if needed
+if (inherits(envs_Cl, "SpatRaster")) {
+  envs_Cl <- raster::stack(envs_Cl)
+}
+
+
+# Check output
+print(envs_Cl)
+```
+
+
+Skip this step if  you want to use in BC layers (above)
+
+Wallace original layers used from WorldClim for biogeoclimatic zones (19 layers).
+
+```{r}
+### Code to use the worldclim data instead
+
+env_vars <- c('bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08',
+              'bio09', 'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16',
               'bio17', 'bio18', 'bio19')
 
 # Environmental data for western BC
 envs_west <- envs_worldclim(
   bcRes = 0.5,
-  bcSel = env_vars, 
+  bcSel = env_vars,
   mapCntr = c(-120.511, 53.347),  # Adjust for western BC
   doBrick = TRUE
 )
@@ -50,29 +179,44 @@ envs_west <- envs_worldclim(
 # Environmental data for eastern BC
 envs_east <- envs_worldclim(
   bcRes = 0.5,
-  bcSel = env_vars, 
+  bcSel = env_vars,
   mapCntr = c(-114.511, 53.347),  # Adjust for eastern BC
   doBrick = TRUE
 )
 
 # Merge environmental data
 envs_Cl <- merge(envs_west, envs_east)
+```
 
+
+
+Run through generating points and attaching environmental variables
+```{r}
 # Storage list for results
 species_results <- list()
 
-# Loop through all species
-for (species in names(userOccs_Cl)) {
+# Define your species of interest
+species_of_interest <- c("Taxidea_taxus", "Lynx_rufus", "Vulpes_vulpes", 
+                         "Lynx_canadensis", "Pekania_pennanti", 
+                         "Martes_americana", "Canis_latrans")
+
+# Subset your species list (assuming userOccs_Cl is the list of all species)
+userOccs_Cl_subset <- userOccs_Cl[intersect(names(userOccs_Cl), species_of_interest)]
+
+# Now you can loop through only the species in your subset
+for (species in names(userOccs_Cl_subset)) {
   message("Processing: ", species)  # Show progress
 
   # Extract cleaned occurrence data
-  occs_Cl <- userOccs_Cl[[species]]$cleaned
+  occs_Cl <- userOccs_Cl_subset[[species]]$cleaned
   
   # Skip species with no cleaned data
   if (nrow(occs_Cl) == 0) next
-
+  
   # Extract environmental values for occurrences
   occs_xy_Cl <- occs_Cl[, c('longitude', 'latitude')]
+  
+  # Extract raster values for occurrences
   occs_vals_Cl <- as.data.frame(raster::extract(envs_Cl, occs_xy_Cl, cellnumbers = TRUE))
 
   # Remove duplicated same cell values
@@ -90,6 +234,8 @@ for (species in names(userOccs_Cl)) {
   bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>% 
     dplyr::filter(name == "British Columbia")
 
+  
+
   # Mask environmental data (this step is the same for each species)
   bgMask_Cl <- penvs_bgMask(
     occs = occs_Cl,
@@ -97,12 +243,13 @@ for (species in names(userOccs_Cl)) {
     bgExt = bc_boundary
   )
 
-  # Sample background points (this step is the same for each species)
-  bgSample_Cl <- penvs_bgSample(
-    occs = occs_Cl,
-    bgMask = bgMask_Cl,
-    bgPtsNum = 10000
-  )
+
+# Sample background points (this step is the same for each species)
+bgSample_Cl <- penvs_bgSample(
+  occs = occs_Cl,
+  bgMask = bgMask_Cl,
+  bgPtsNum = 5000
+)
 
   # Partition occurrence data (this step is the same for each species)
   groups_Cl <- part_partitionOccs(
@@ -115,11 +262,19 @@ for (species in names(userOccs_Cl)) {
 
   # Extract background environmental values
   bgEnvsVals_Cl <- as.data.frame(raster::extract(bgMask_Cl, bgSample_Cl))
-  bgEnvsVals_Cl <- cbind(scientific_name = paste0("bg_", species), bgSample_Cl,
-                         occID = NA, year = NA, institution_code = NA, country = NA,
-                         state_province = NA, locality = NA, elevation = NA,
-                         record_type = NA, bgEnvsVals_Cl)
+  
+  # Ensure row names are consistent
+  rownames(bgEnvsVals_Cl) <- NULL  
 
+  # Ensure the number of columns in cbind() matches
+  bgEnvsVals_Cl <- cbind(
+    scientific_name = paste0("bg_", species),
+    bgSample_Cl,
+    occID = NA, year = NA, institution_code = NA, country = NA,
+    state_province = NA, locality = NA, elevation = NA,
+    record_type = NA, bgEnvsVals_Cl
+  )
+  
   # Store results for this species
   species_results[[species]] <- list(
     occurrences = occs_Cl,
@@ -130,6 +285,7 @@ for (species in names(userOccs_Cl)) {
 
 # Print summary of results
 print(lapply(species_results, function(x) nrow(x$occurrences)))
+
 
 
 ```
@@ -165,9 +321,10 @@ print(species_sample_sizes)
 ## Also subset out the species that did run correctly, for this test run:
 
 # List of species to exclude
-exclude_species <- c("Urocyon_cinereoargenteus","Erethizon_dorsatum", "Spilogale_gracilis")
-# 
-# "Taxidea_taxus", "Lynx_rufus", "Vulpes_vulpes","Tamiasciurus_hudsonicus", "Lynx_canadensis", "Pekania_pennanti", "Glaucomys_sabrinus", "Mustela_erminea", "Tamiasciurus_hudsonicus", "Neogale_vison", "Martes_americana", "Canis_latrans"
+exclude_species <- c("Urocyon_cinereoargenteus","Erethizon_dorsatum", "Spilogale_gracilis","Glaucomys_sabrinus",
+ "Mustela_erminea", "Tamiasciurus_hudsonicus", "Neogale_vison","Tamiasciurus_hudsonicus", "Lepus americanus", "Procyon lotor")
+                     
+# "Taxidea_taxus", "Lynx_rufus", "Vulpes_vulpes", "Lynx_canadensis", "Pekania_pennanti",  "Martes_americana", "Canis_latrans"
 
 # Filter out species
 filtered_species <- setdiff(names(species_results), exclude_species)
@@ -179,9 +336,6 @@ filtered_species <- setdiff(names(species_results), exclude_species)
 
 #run through model forloop
 ```{r}
-library(raster)
-
-# Storage list for model results
 species_models <- list()
 
 # Loop through each species
@@ -193,12 +347,6 @@ for (species in names(species_results)[!(names(species_results) %in% exclude_spe
   bgEnvsVals_Cl <- species_results[[species]]$background
   groups_Cl <- species_results[[species]]$partitions
 
-  # 🚨 Check if occurrence data exists
-  if (is.null(occs_Cl) || nrow(occs_Cl) == 0) {
-    message("⚠ Skipping ", species, " due to missing occurrences")
-    next
-  }
-
   # Load BC boundary (ensure it works)
   bc_boundary <- tryCatch(
     ne_states(country = "Canada", returnclass = "sf") %>% 
@@ -208,12 +356,6 @@ for (species in names(species_results)[!(names(species_results) %in% exclude_spe
 
   if (is.null(bc_boundary)) {
     message("⚠ Skipping ", species, " because BC boundary could not be loaded")
-    next
-  }
-
-  # 🚨 Check if environmental layers exist
-  if (!exists("envs_Cl") || is.null(envs_Cl) || !is(envs_Cl, "RasterBrick")) {
-    message("⚠ Skipping ", species, " due to missing environmental layers")
     next
   }
 
@@ -236,7 +378,7 @@ for (species in names(species_results)[!(names(species_results) %in% exclude_spe
   bgSample_Cl <- penvs_bgSample(
     occs = occs_Cl,
     bgMask = bgMask_Cl,
-    bgPtsNum = 10000
+    bgPtsNum = 5000
   )
 
   # Check if background points exist
@@ -246,18 +388,20 @@ for (species in names(species_results)[!(names(species_results) %in% exclude_spe
   }
 
   # ✅ Run MaxEnt model
-  model_Cl <- model_maxent(
+# bias <- rep(5, nrow(occs_Cl)) #option to add bias, include , weights=bias in below
+    model_Cl <- model_maxent(
     occs = occs_Cl,
     bg = bgEnvsVals_Cl,
     user.grp = groups_Cl, 
     bgMsk = bgMask_Cl,
-    rms = c(1, 2), 
+    rms = c(2,3,4), 
     rmsStep = 1,
-    fcs = 'L',
-    clampSel = FALSE,
+    fcs = 'LQ', #allowing MaxEnt to be more flexible and fit more complex relationships instead of just linear (L) 
+    clampSel = TRUE, ## restrict predictions to conditions seen in occurrence points
     algMaxent = "maxnet",
     parallel = FALSE,
     numCores = 27
+    
   )
 
   # Store model results
@@ -270,20 +414,174 @@ print(lapply(species_models, class))
 ```
 
 
+
+Extract AUC model results:
+```{r}
+# Initialize storage for AUC values
+species_auc_list <- list()
+
+# Loop through each species
+for (species in names(species_models)) {
+  model <- species_models[[species]]
+  
+  # Ensure results exist
+  if (!is.null(model@results) && "auc.val.avg" %in% colnames(model@results)) {
+    
+    # Extract all models' AUC values
+    auc_vals <- data.frame(
+      fc = model@results$fc,
+      rm = model@results$rm,
+      auc_train = model@results$auc.train,  # Training AUC
+      auc_val = model@results$auc.val.avg,  # Validation AUC
+      delta_AICc = model@results$delta.AICc,  # AICc delta for model selection
+      w_AIC = model@results$w.AIC  # Model weight (lower AICc = better model)
+    )
+    
+    # Store all model results per species
+    species_auc_list[[species]] <- auc_vals
+  } else {
+    species_auc_list[[species]] <- NA  # Handle missing data
+  }
+}
+
+# Convert list to a single dataframe
+auc_df <- do.call(rbind, Map(data.frame, species = names(species_auc_list), results = species_auc_list))
+
+# Print and save results
+print(auc_df)
+write.csv(auc_df, "MaxEnt_AUC_Comparison.csv", row.names = FALSE)
+
+
+
+```
+Extract environmental covariate values
+
+```{r}
+
+# Temporarily remove any geometry data from bec_zones if it's a spatial object
+bec_zones_df <- st_drop_geometry(bec_zones)
+
+# Create a table with unique Zone_ID and ZONE_NAME from the bec_zones dataframe
+bec_zone_table_unique <- bec_zones_df %>% 
+  select(ZONE_ID, ZONE_NAME) %>%
+  distinct()
+
+# View the resulting table
+print(bec_zone_table_unique)
+
+
+# Create an empty list to store variable importance
+coeff_summary <- list()
+
+# Loop through each species to extract the best model's coefficients
+for (species in names(species_models)) {
+  
+  model <- species_models[[species]]
+  
+  # Identify the top model (e.g., based on AICc or AUC)
+  top_model <- model@models[[which.max(model@results$auc.val.avg)]]
+  
+  # Extract environmental variable names and their corresponding coefficients (betas)
+  if (!is.null(top_model) && "betas" %in% names(top_model)) {
+    betas <- top_model$betas  # Extract coefficients
+    
+    # Store the betas with variable names as a data frame
+    coeff_df <- data.frame(
+      Variable = names(betas),
+      Beta_Coefficient = betas,
+      Species = species
+    )
+    
+    coeff_summary[[species]] <- coeff_df
+  } else {
+    message("No betas found for species: ", species)
+  }
+}
+
+# Combine all species' results into a single data frame
+coeff_summary_df <- do.call(rbind, coeff_summary)
+
+# Now join the 'bec_zone_table_unique' with 'coeff_summary_df' to get the zone names
+# Extract the zone ID from the 'Variable' column (e.g., "bec_zone_11" -> 11)
+coeff_summary_df$ZONE_ID <- as.numeric(gsub("BEC_Zone_", "", coeff_summary_df$Variable))
+
+# Join with the bec_zone_table_unique to add ZONE_NAME
+final_coeff_summary_df <- left_join(coeff_summary_df, bec_zone_table_unique, by = "ZONE_ID")
+
+# Modify the 'Variable' column for elevation and canopy height
+final_coeff_summary_df <- final_coeff_summary_df %>%
+  mutate(
+    Variable = case_when(
+      Variable == "wc2.1_30s_elev" ~ "elevation",
+      Variable == "cover_code" ~ "canopy height",
+      TRUE ~ Variable
+))
+# View the final results
+print(final_coeff_summary_df)
+
+
+```
+
+Get jacknife results for environmental variables:
+
+```{r}
+# Create an empty list to store variable importance
+coeff_summary <- list()
+
+# Loop through each species to extract the best model's coefficients and importance
+for (species in names(species_models)) {
+  
+  model <- species_models[[species]]
+  
+  # Identify the top model (e.g., based on AICc or AUC)
+  top_model <- model@models[[which.max(model@results$auc.val.avg)]]
+  
+  # Extract environmental variable names and their corresponding coefficients (betas)
+  if (!is.null(top_model) && "betas" %in% names(top_model)) {
+    betas <- top_model$betas  # Extract coefficients
+    
+    # Get variable contributions (importance)
+    variable_contribution <- top_model@results$variable.importance
+    
+    # Get Jackknife AUC and Gain values
+    jackknife_auc <- top_model@results$jackknife.test$auc
+    jackknife_gain <- top_model@results$jackknife.test$gain
+
+    # Create data frame of coefficients and variable importance
+    coeff_df <- data.frame(
+      Variable = names(betas),
+      Beta_Coefficient = betas,
+      Variable_Contribution = variable_contribution,
+      Jackknife_AUC = jackknife_auc,
+      Jackknife_Gain = jackknife_gain,
+      Species = species
+    )
+    
+    coeff_summary[[species]] <- coeff_df
+  } else {
+    message("No betas found for species: ", species)
+  }
+}
+
+# Combine all species' results into a single data frame
+coeff_summary_df <- do.call(rbind, coeff_summary)
+
+# View the coefficients summary with variable importance and Jackknife statistics
+print(coeff_summary_df)
+
+```
+
+
+
 Forloop through mapping each species distribution
 ```{r}
-# Load necessary libraries
-library(leaflet)
-library(webshot)
-library(htmlwidgets)
-library(raster)
-
-# Ensure webshot is installed
-# webshot::install_phantomjs()
+# Load the BC highways shapefile
+bc_highways <- st_read("C:/LocalR/SDM_mesocarnivores/GIS/DBMBC7HML5_line.shp")  # Update the path
+bc_highways <- st_transform(bc_highways, crs = crs(elevation))
 
 # Create output directory if it doesn't exist
-if (!dir.exists("species_maps")) {
-  dir.create("species_maps")
+if (!dir.exists("species_maps_test")) {
+  dir.create("species_maps_test")
 }
 
 # Loop through all species
@@ -297,14 +595,21 @@ for (species in names(species_models)) {
 
 
   # Select MaxEnt model safely
-  m_Cl <- tryCatch(model_Cl@models[["fc.L_rm.1"]], error = function(e) NULL)
+  m_Cl <- tryCatch(model_Cl@models[["fc.LQ_rm.2"]], error = function(e) NULL)  ## You need to adjust LQ/L/etc. if you alter fc= in the model earlier
 
     # Get prediction for the species using the model
   predSel_Cl <- tryCatch(
-    predictMaxnet(m_Cl, bgMask_Cl, type = "logistic", clamp = FALSE),
+    predictMaxnet(m_Cl, bgMask_Cl, type = "logistic", clamp = TRUE),## adjusted clamp here too
     error = function(e) NULL
   )
   
+# # Smooth categorical boundaries using bilinear interpolation
+# predSel_Cl <- focal(predSel_Cl, w = focalMat(predSel_Cl, 3, "Gauss"), fun = mean, na.policy = "omit")
+
+# Apply a focal mean filter (3x3 window)
+predSel_Cl_smoothed <- focal(predSel_Cl, w = matrix(1, 3, 3), fun = mean, na.policy = "omit")
+
+predSel_Cl <- resample(predSel_Cl_smoothed, predSel_Cl_smoothed, method = "bilinear")
 
   # Get values of prediction (ensure valid raster before proceeding)
   mapPredVals_Cl <- tryCatch(getValues(predSel_Cl), error = function(e) NULL)
@@ -321,7 +626,29 @@ for (species in names(species_models)) {
   m <- leaflet() %>%
     addProviderTiles(providers$Esri.WorldTopoMap)
 
-  m2 <- m %>%
+
+# Aggregate raster by a factor (e.g., 2x2)
+predSel_Cl_resampled <- aggregate(predSel_Cl, fact = 2, fun = mean) 
+
+# Use the smaller raster in the map
+m2 <- m %>%
+  addRasterImage(predSel_Cl_resampled, colors = rasPal, opacity = 0.9, 
+                 group = 'vis', layerId = 'mapPred', method = "ngb")
+
+  # Add BC highways layer
+m2 <- m2 %>%
+  leaflet::addPolylines(data = bc_highways,
+                        color = "black", 
+                        weight = 2,
+                        opacity = 0.8,
+                        group = "BC Highways",
+                        popup = ~NGLSHNM) %>%
+  addLayersControl(
+    overlayGroups = c("BC Highways", "vis"),
+    options = layersControlOptions(collapsed = FALSE)
+  )               
+  
+  m2 <- m2 %>%
     leaflet::addLegend("bottomright", pal = legendPal,
                        title = "Predicted Suitability",
                        values = rev(legendValues),  
@@ -339,7 +666,7 @@ for (species in names(species_models)) {
                    group = 'vis', layerId = 'mapPred', method = "ngb")
 
   # Save the map to an HTML file
-  map_filename <- paste0("species_maps/", species, "_map.html")
+  map_filename <- paste0("species_maps_test/", species, "_map.html")
   saveWidget(m2, map_filename, selfcontained = TRUE)
 
   # Optionally, view the map in the RStudio Viewer
@@ -401,6 +728,12 @@ for (species in names(species_results)) {
 }
 
 message("All rasters exported successfully!")
+
+```
+
+View Maxent AUC model competition results and export
+
+```{r}
 
 ```
 
