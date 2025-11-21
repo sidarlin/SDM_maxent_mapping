@@ -1,0 +1,4358 @@
+---
+title: "Maxent_Models_forloop"
+output: html_document
+date: "2025-03-26"
+Authors: Initial code from Wallace developers and R code modified by Siobhan Darlington & Chapt GPT/Copilot
+---
+
+Forloop through spatial layer extractions and generating points, customize models by species at later steps and forloop through creating maps. 
+
+
+Directory:
+1. Load libraries
+2. Load species data from your cleaned Wallace Csv with three columns
+3. *Skip* Summary statistics of the final sample sizes (unique locations)
+4. Stacking environmental variables for envs_Cl formation
+5. *Skip* Make different boundaries for generating random points and assign species for each
+6. Customize the background extent by species, run through generating points accounting for sampling bias, and attaching environmental variables.
+7. Model forloop with all rms and custom L vs. LQ
+8. Extract and save AUC model results
+9. Extract environmental covariate values
+10. Plot and save the top model beta coefficients for each species in a multi panel plot
+11. Plot and save variable importance 
+12. Find the top important variables across species to create the density plot
+13. Plot for a representative winner, neutral and loser species for top 3 most important variables.
+Using current model outputs
+14. Extract and save variable response curves by species
+15. Plot selected species variable response curves (similar to occurrence density above)
+16. Export Baseline Climate Rasters
+17. Alternatively - Generate rasters using MESS integrated AND Convex Hull
+18. Plot the Multi panel with MESS rasters
+19. Run future climate rasters in a forloop 
+20. Create future bioclim rasters
+21. Create MESS rasters and apply to existing predictions
+22. Create adjusted rasters to more conservative future layers
+23. MESS future raster multi plot
+24. Reclassify to include a neutral zone with 10% change on either end
+25. Fixed reclassify to include a neutral zone with 10% change on either end to account for haida gwaii missing, NA values in the MESS mask changed to 0
+26. Bins for richness map (gain/stable/loss multi panel across species)
+27. This is a 40-60 Climate suitability threshold version *Adjusted plot to match the map scheme*
+28. Create a summary figure across scenarios for net gain and net loss
+
+
+
+1. Load libraries
+```{r}
+# Spatial and environmental data
+library(sf)
+library(spocc)
+library(spThin)
+library(raster)
+library(terra)         # modern replacement for raster
+library(geodata)       # WorldClim and related datasets
+library(rnaturalearth)
+library(mapview)
+library(leaflet)
+library(concaveman)
+library(spatstat.geom)
+
+# Species distribution modeling
+library(dismo)
+library(ENMeval)
+library(wallace)
+library(maxnet)
+library(pROC)
+library(MASS)
+library(usdm)
+library(raster)
+
+# Data manipulation
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(forcats)
+library(purrr)
+library(parallel)
+library(fs)
+
+# Visualization
+library(ggplot2)
+library(viridis)
+library(patchwork)
+library(ggh4x)
+library(htmlwidgets)
+library(webshot)
+```
+
+I am using the presence-only output from the Merge_datacollation_2025.Rmd containing camera detections, incidentals, DNA, trapper data, and museum records. 
+
+I have further removed subspecies names and excluded records earlier than 2000 and records outside of BC borders
+
+2. Load species data from your cleaned Wallace Csv with three columns:
+-species_scientific, species scientific names, no subspecies and no "sp" undefined species
+-latitude,in decimal degrees
+-longitude, in decimal degrees
+
+*Note that duplicate locations will be removed at a later step, if you forgot to clean the file beforehand
+
+```{r}
+# Define file paths
+raw_file <- "Input_data/wallace_data_Nov172025.csv"
+ clean_file <- "Input_data/wallace_data_clean_Nov172025.csv"
+
+# Clean and save
+read.csv(raw_file, header = TRUE) %>%
+  filter(
+    !is.na(scientific_name),
+    str_count(scientific_name, "\\S+") == 2,
+    !str_detect(scientific_name, regex("\\bsp\\.?\\b", ignore_case = TRUE))
+  ) %>%
+  write.csv(clean_file, row.names = FALSE)
+
+occs_path <- "Input_data"
+occs_path <- file.path(occs_path, "wallace_data_clean_Nov172025.csv")
+
+# Get a list of species occurrence data
+userOccs_Cl <- occs_userOccs(
+  txtPath = occs_path, 
+  txtName = "wallace_data_clean_Nov172025.csv", 
+  txtSep = ",", 
+  txtDec = "."
+)
+```
+
+2.2 Data thinning step
+```{r}
+#Create a data frame for all of the species occurrences
+occ_df <- bind_rows(lapply(names(userOccs_Cl), function(sp) {
+  df <- userOccs_Cl[[sp]]$orig       # extract species occurrences
+  df$scientific_name <- sp           # add species column
+  df
+}))
+
+
+### Make a raster with the extent from which to thin
+ext <- ext(min(occ_df$longitude),
+           max(occ_df$longitude),
+           min(occ_df$latitude),
+           max(occ_df$latitude))
+
+res <- 1/120  # 30 arc-second in degrees (the resolution of the Worldclim data)
+r_template <- rast(ext, resolution = 1/120, crs = "EPSG:4326")
+values(r_template) <- NA
+
+
+occ_df_thin <- occ_df %>%
+  mutate(
+    # round coordinates to 30 arc-second pixels
+    lon_round = round(longitude / (1/120)) * (1/120),
+    lat_round = round(latitude  / (1/120)) * (1/120),
+    # replace underscores with spaces in species names
+    scientific_name = str_replace_all(scientific_name, "_", " ")
+  ) %>%
+  group_by(scientific_name, lon_round, lat_round) %>%
+  slice(1) %>%   # keep one record per pixel
+  ungroup() %>%
+  dplyr::select(scientific_name, longitude = lon_round, latitude = lat_round)
+
+# Convert thinned occurrences to sf points
+occ_sf <- st_as_sf(occ_df_thin, coords = c("longitude", "latitude"), crs = 4326)
+
+# Get BC polygon for context
+bc <- rnaturalearth::ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia")
+
+# Multi-panel map
+ggplot() +
+  geom_sf(data = bc, fill = "grey95", color = "black") +
+  geom_sf(data = occ_sf, color = "red", size = 1.2, alpha = 0.7) +
+  facet_wrap(~scientific_name) +
+  theme_minimal() +
+  labs(
+    title = "Thinned Species Occurrences by Species",
+    subtitle = "One point per 30 arc-second pixel",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.background = element_rect(fill = "aliceblue")
+  )
+
+
+# number of original points per species
+orig_counts <- occ_df %>%
+  group_by(scientific_name) %>%
+  summarise(n_orig = n())
+
+# number of thinned points per species
+thin_counts <- occ_df_thin %>%
+  group_by(scientific_name) %>%
+  summarise(n_thin = n())
+
+# combine and compute loss
+loss_summary <- orig_counts %>%
+  left_join(thin_counts, by = "scientific_name") %>%
+  mutate(
+    n_lost = n_orig - n_thin,
+    prop_retained = round(n_thin / n_orig, 3),
+    prop_lost = round(n_lost / n_orig, 3)
+  ) %>%
+  arrange(scientific_name)
+
+loss_summary
+
+
+write.csv(occ_df_thin, "Input_data/wallace_data_thinned_Nov172025.csv", row.names = FALSE)
+
+
+### Redefine userOccs_Cl with thinned data
+occs_path <- "Input_data"
+occs_path <- file.path(occs_path, "wallace_data_thinned_Nov172025.csv")
+
+# Get a list of species occurrence data
+userOccs_Cl <- occs_userOccs(
+  txtPath = occs_path, 
+  txtName = "wallace_data_thinned_Nov172025.csv", 
+  txtSep = ",", 
+  txtDec = "."
+)
+
+```
+
+
+2.3 *SKIP* Map data thinned points kept and lost
+```{r}
+
+occ_df <- bind_rows(lapply(names(userOccs_Cl), function(sp) {
+  df <- userOccs_Cl[[sp]]$orig       # extract species occurrences
+  df$scientific_name <- sp           # add species column
+  df
+}))
+
+# Add pixel coordinates
+occ_df <- occ_df %>%
+  mutate(
+    lon_pix = round(longitude / (1/120)) * (1/120),
+    lat_pix = round(latitude  / (1/120)) * (1/120)
+  )
+
+# Identify kept vs removed points per pixel per species
+occ_df <- occ_df %>%
+  group_by(scientific_name, lon_pix, lat_pix) %>%
+  mutate(
+    kept = row_number() == 1      # first point in pixel is kept
+  ) %>%
+  ungroup()
+
+# Split into kept and removed points
+kept_sf <- occ_df %>%
+  filter(kept) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+removed_sf <- occ_df %>%
+  filter(!kept) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# BC polygon
+bc <- rnaturalearth::ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia")
+
+# Plot
+ggplot() +
+  geom_sf(data = bc, fill = "grey95", color = "black") +
+  geom_sf(data = kept_sf, color = "black", size = 1, alpha = 0.7) +     # kept points
+  geom_sf(data = removed_sf, color = "red", size = 1, alpha = 0.7) +    # removed points on top
+  facet_wrap(~scientific_name) +
+  theme_minimal() +
+  labs(
+    title = "Thinning Results: Kept vs Removed Points",
+    subtitle = "Black = kept, Red = removed points (on top)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.background = element_rect(fill = "aliceblue")
+  )
+
+```
+
+
+
+
+3. *SKIP* Summary statistics of the final sample sizes (unique locations)
+```{r}
+# Per-species summary of unique occurrence counts
+species_summary <- map_df(
+  names(userOccs_Cl),
+  function(sp) {
+    occs <- userOccs_Cl[[sp]]$cleaned
+    n_unique <- occs %>%
+      select(longitude, latitude) %>%
+      distinct() %>%
+      nrow()
+    tibble(species = sp, n_unique_occurrences = n_unique)
+  }
+)
+
+# Print per-species values
+print(species_summary)
+
+# Overall stats: total, mean, range, SD
+summary_stats <- species_summary %>%
+  summarise(
+    total_occurrences = sum(n_unique_occurrences),
+    mean_occurrences = mean(n_unique_occurrences),
+    sd_occurrences = sd(n_unique_occurrences),
+    min_occurrences = min(n_unique_occurrences),
+    max_occurrences = max(n_unique_occurrences)
+  )
+
+print(summary_stats)
+```
+
+- World Bioclim (19 variables)
+- Distance to water
+-Paved road density
+
+Wallace original layers used from WorldClim for biogeoclimatic zones (19 layers).
+https://www.worldclim.org/data/bioclim.html
+
+BIO1 = Annual Mean Temperature
+BIO2 = Mean Diurnal Range (Mean of monthly (max temp - min temp))
+BIO3 = Isothermality (BIO2/BIO7) (×100)
+BIO4 = Temperature Seasonality (standard deviation ×100)
+BIO5 = Max Temperature of Warmest Month
+BIO6 = Min Temperature of Coldest Month
+BIO7 = Temperature Annual Range (BIO5-BIO6)
+BIO8 = Mean Temperature of Wettest Quarter
+BIO9 = Mean Temperature of Driest Quarter
+BIO10 = Mean Temperature of Warmest Quarter
+BIO11 = Mean Temperature of Coldest Quarter
+BIO12 = Annual Precipitation
+BIO13 = Precipitation of Wettest Month
+BIO14 = Precipitation of Driest Month
+BIO15 = Precipitation Seasonality (Coefficient of Variation)
+BIO16 = Precipitation of Wettest Quarter
+BIO17 = Precipitation of Driest Quarter
+BIO18 = Precipitation of Warmest Quarter
+BIO19 = Precipitation of Coldest Quarter
+
+
+
+4. Stacking environmental variables for envs_Cl formation
+```{r}
+# Load elevation raster and set it as the base
+ref_layer <- raster("Input_GIS/elevation_BC_clip.tif")
+
+# Set folder path for historical climate data
+historical_dir <- "Input_GIS/WC2.1_Historical_climate"
+
+# Generate full file paths for bio1 to bio19 in the correct order
+bioclim_indices <- 1:19
+historical_files <- file.path(historical_dir, paste0("wc2.1_30s_bio_", bioclim_indices, ".tif"))
+
+# Load and stack the raster layers
+historical_stack <- stack(historical_files)
+
+# Rename layers as bioclim.1 to bioclim.19
+names(historical_stack) <- paste0("bioclim.", bioclim_indices)
+
+# Resample to match reference raster
+historical_resampled <- resample(historical_stack, ref_layer, method = "bilinear")
+
+envs_Cl <- stack(historical_resampled)
+
+# Generate a viridis color palette with 100 values
+viridis_cols <- viridis(100)
+
+# Plot using the viridis palette
+plot(envs_Cl, col = viridis_cols)
+
+# Now elevation is already the reference, no need to reproject it
+elevation <- ref_layer
+
+# Load and resample other raster layers
+water <- rast("Input_GIS/distance_to_water.tif")
+ref_rast <- rast(ref_layer)
+water_proj <- project(water, ref_rast, method = "bilinear", filename = "Input_GIS/distance_water_proj.tif", overwrite = TRUE)
+water <- raster(water_proj)
+water<- resample(water, ref_layer, method = "bilinear")
+
+## Roads
+
+roads <- rast("Input_GIS/pav_dens_10k.tif")
+ref_rast <- rast(ref_layer)
+roads_proj <- project(roads, ref_rast, filename = "roads_projected.tif", overwrite = TRUE)
+roads <- raster("Input_GIS/roads_projected.tif")
+roads <- resample(roads, ref_layer, method = "bilinear")
+
+
+## Combine all layers
+envs_Cl2 <- stack(
+  envs_Cl,
+  elevation,
+  water,
+  roads
+)
+
+## Rename layers
+current_names <- names(envs_Cl2)
+new_names <- current_names
+bioclim_indices <- grep("^layer\\.\\d+$", current_names)
+new_names[bioclim_indices] <- paste0("bioclim.", seq_along(bioclim_indices))
+new_names[new_names == "wc2.1_30s_elev"] <- "elevation"
+new_names[new_names == "layer"] <- "dist_water"
+names(envs_Cl2) <- new_names
+
+
+# Final output
+envs_Cl <- envs_Cl2
+
+```
+
+
+*SKIP IF YOU ALREADY HAVE THESE*
+5. Make different boundaries for generating random points and assign species for each
+- BC-wide
+- Haida Gwaii only
+- Vancouver Island only
+- Mainland only
+- Others? 
+```{r}
+# 2. Multi-part geometry into individual polygons
+# bc_parts <- st_cast(bc_boundary, "POLYGON")
+# 
+# # 3. Plot to visually identify which part is Haida Gwaii (optional)
+# plot(st_geometry(bc_parts))
+# 
+# # 4. Calculate centroids to help find Haida Gwaii
+# bc_parts$centroid <- st_centroid(bc_parts$geometry)
+# bc_parts$lon <- st_coordinates(bc_parts$centroid)[,1]
+# bc_parts$lat <- st_coordinates(bc_parts$centroid)[,2]
+# 
+# # 5. Use latitude and longitude to filter Haida Gwaii (approx: 52.5°N, -132.5°W)
+# # Adjust bounds as needed
+# haida_gwaii <- bc_parts %>%
+#   filter(lon < -131 & lat > 52 & lat < 54.5)
+# 
+# # 6. Drop the helper columns
+# haida_gwaii <- haida_gwaii %>% dplyr::select(-centroid, -lon, -lat)
+# plot(st_geometry(haida_gwaii))
+
+# 
+# # 7. Save as a new shapefile
+# st_write(haida_gwaii, "Input_GIS/Haida_Gwaii.shp")
+# 
+haida_gwaii <- st_read(dsn="Input_GIS/Haida_Gwaii.shp")
+
+# ## Repeat  5-7 for Vancouver Island and BC Mainland only
+# 
+# 
+# # 5. Use latitude and longitude to filter Vancouver Island (approx: 52.5°N, -132.5°W)
+# # Adjust bounds as needed
+# van_isle <- bc_parts %>%
+#   filter(lon > -128 & lon < -123 & lat > 48 & lat < 51)
+# 
+# # 6. Drop the helper columns
+# van_isle <- van_isle %>% select(-centroid, -lon, -lat)
+# plot(st_geometry(van_isle))
+# 
+# 
+# # 7. Save as a new shapefile
+# st_write(van_isle, "Input_GIS/Vancouver_island.shp")
+
+
+
+# Mainland BC
+bc_main <- bc_parts %>%
+  filter(
+    # Keep features that are NOT Vancouver Island
+    !(lon > -128.8 & lon < -123.0 & lat > 48.2 & lat < 51.0),
+    # AND not Haida Gwaii
+    !(lon < -130 & lat > 52 & lat < 54.5),
+    # AND not Gulf Islands
+    !(lon > -124.5 & lon < -123.0 & lat > 48.3 & lat < 49.5)
+  )
+
+
+# 6. Drop the helper columns
+bc_main <- bc_main %>% select(-centroid, -lon, -lat)
+plot(st_geometry(bc_main))
+
+
+# 7. Save as a new shapefile
+st_write(bc_main, "Input_GIS/BC_mainland.shp")
+
+### Vanisle + BC Main
+bc_isle_main <- combine(bc_main, van_isle)
+
+#Save as a new shapefile
+st_write(bc_isle_main, "Input_GIS/BC_vanisle_main.shp")
+```
+
+
+*SKIP* Correlation check across envs_Cl - Note that Maxent downweights and removes redundant variables while training for each species - so removing variables now would not necessarily improve the performance - only remove our ability to compare values across species as a reduced variable set leads to less common predictors. 
+```{r}
+library(raster)
+
+# 1. Extract raster values (sample to speed things up)
+#    Using 50,000 random cells is usually enough; adjust up/down.
+set.seed(123)
+vals <- sampleRandom(envs_Cl_final, size = 50000, na.rm = TRUE)
+
+# 2. Compute correlation matrix
+cor_mat <- cor(vals, use = "pairwise.complete.obs", method = "pearson")
+
+# 3. Check pairwise collinearity > 0.8
+high_corr <- which(abs(cor_mat) > 0.8 & abs(cor_mat) < 1, arr.ind = TRUE)
+
+# 4. Print pairs
+corr_pairs <- data.frame(
+  var1 = rownames(cor_mat)[high_corr[,1]],
+  var2 = colnames(cor_mat)[high_corr[,2]],
+  r    = cor_mat[high_corr]
+)
+
+corr_pairs ## 66 pairs/combos are correlated > 0.8 in general
+
+
+## Using variable importance from previously run model:
+
+# -------------------------------
+# 1. Your required variables
+# -------------------------------
+must_keep <- c(
+  "bioclim.1",
+  "bioclim.13",
+  "bioclim.5",
+  "bioclim.18",
+  "bioclim.6",
+  "bioclim.14",
+  "bioclim.2",
+  "bioclim.11",
+  "elevation",
+  "dist_water",
+  "pav_dens_10k"
+)
+
+# Remove duplicates
+must_keep <- unique(must_keep)
+
+# -------------------------------
+# 2. Compute correlation matrix
+# -------------------------------
+set.seed(123)
+vals <- sampleRandom(envs_Cl, size = 50000, na.rm = TRUE)
+
+cor_mat <- cor(vals, use = "pairwise.complete.obs")
+
+# -------------------------------
+# 3. Find variables that are 
+#    NOT correlated > 0.8 with 
+#    ANY must_keep variable
+# -------------------------------
+all_vars <- colnames(cor_mat)
+
+# Function: TRUE if variable is safe (all correlations < 0.8 in magnitude)
+is_uncorrelated <- function(v) {
+  # Skip must-keep (we always keep them regardless of correlation)
+  if (v %in% must_keep) return(TRUE)
+  
+  # Correlation values between v and all must-keep vars
+  cors <- abs(cor_mat[v, must_keep])
+  
+  # Keep only if ALL correlations are < 0.8
+  all(cors < 0.8)
+}
+
+# Apply function to each predictor
+safe_vars <- all_vars[sapply(all_vars, is_uncorrelated)]
+
+# -------------------------------
+# 4. Final variable list
+# -------------------------------
+final_vars <- unique(c(must_keep, safe_vars))
+
+final_vars
+# This prints the full set of allowed predictors
+
+# -------------------------------
+# 5. Subset your raster stack
+# -------------------------------
+envs_Cl_final <- envs_Cl[[final_vars]]
+
+```
+
+
+
+6. Customize the background extent by species, run through generating points accounting for sampling bias, and attaching environmental variables
+```{r}
+# 🔹 Lookup 1: assign each species to a spatial extent (region shapefile)
+species_region <- c(
+  "Taxidea_taxus"       = "bc_main",
+  "Lynx_rufus"          = "bc_main",
+  "Vulpes_vulpes"       = "bc_main",      
+  "Lynx_canadensis"     = "bc_main",
+  "Pekania_pennanti"    = "bc_main",
+  "Canis_latrans"       = "bc_main",
+  "Martes_spp"          = "bc_boundary",
+  "Mustela_haidarum"    = "haida_gwaii",
+  "Neogale_vison"       = "bc_boundary",
+  "Mustela_nivalis"     = "bc_main",
+  "Neogale_frenata"     = "bc_main",
+  "Lontra_canadensis"   = "bc_boundary",
+  "Procyon_lotor"       = "bc_boundary", 
+  "Mephitis_mephitis"   = "bc_main",
+  "Spilogale_gracilis"  = "bc_main",
+  "Gulo_gulo"           = "bc_main",
+  "Mustela_richardsonii"= "bc_isle_main")
+
+# 🔹 Lookup 2: assign background sampling method
+# "Bias" implies using bias correction layer versus "region" means without it.
+
+# species_bg_method <- c(
+#   "Taxidea_taxus"        = "region",
+#   "Lynx_rufus"           = "region",
+#   "Vulpes_vulpes"        = "bias",
+#   "Lynx_canadensis"      = "bias",
+#   "Pekania_pennanti"     = "bias",
+#   "Canis_latrans"        = "bias",
+#   "Martes_spp"           = "bias",
+#   "Mustela_haidarum"     = "region",
+#   "Neogale_vison"        = "region",
+#   "Mustela_nivalis"      = "region",
+#   "Neogale_frenata"      = "region",
+#   "Lontra_canadensis"    = "bias",
+#   "Procyon_lotor"        = "region", 
+#   "Mephitis_mephitis"    = "region",
+#   "Spilogale_gracilis"   = "region",
+#   "Gulo_gulo"            = "bias",
+#   "Mustela_richardsonii" = "bias"
+# )
+
+
+### Use bias correction for all
+species_bg_method <- c(
+  "Taxidea_taxus"        = "bias",
+  "Lynx_rufus"           = "bias",
+  "Vulpes_vulpes"        = "bias",
+  "Lynx_canadensis"      = "bias",
+  "Pekania_pennanti"     = "bias",
+  "Canis_latrans"        = "bias",
+  "Martes_spp"           = "bias",
+  "Mustela_haidarum"     = "bias",
+  "Neogale_vison"        = "bias",
+  "Mustela_nivalis"      = "bias",
+  "Neogale_frenata"      = "bias",
+  "Lontra_canadensis"    = "bias",
+  "Procyon_lotor"        = "bias",
+  "Mephitis_mephitis"    = "bias",
+  "Spilogale_gracilis"   = "bias",
+  "Gulo_gulo"            = "bias",
+  "Mustela_richardsonii" = "bias"
+)
+
+
+# 🔹 Load regional shapefiles
+bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia")
+
+bc_main       <- st_read("Input_GIS/BC_mainland.shp")        %>% st_transform(crs(envs_Cl))
+haida_gwaii   <- st_read("Input_GIS/Haida_Gwaii.shp")        %>% st_transform(crs(envs_Cl))
+van_isle      <- st_read("Input_GIS/Vancouver_island.shp")   %>% st_transform(crs(envs_Cl))
+bc_isle_main  <- st_read("Input_GIS/BC_vanisle_main.shp")    %>% st_transform(crs(envs_Cl))
+
+region_shapefiles <- list(
+  bc_boundary  = bc_boundary,
+  bc_isle_main = bc_isle_main,
+  bc_main      = bc_main,
+  haida_gwaii  = haida_gwaii,
+  van_isle     = van_isle
+)
+
+# 🔹 Function to create a kernel density raster
+make_bias_raster <- function(occs_xy, ref_raster, bandwidth = 0.5) {
+  kde <- MASS::kde2d(
+    x = occs_xy$longitude,
+    y = occs_xy$latitude,
+    h = bandwidth,
+    n = c(ncol(ref_raster), nrow(ref_raster)),
+    lims = as.vector(extent(ref_raster))
+  )
+
+  kde_raster <- raster(list(x = kde$x, y = kde$y, z = kde$z),
+                       crs = crs(ref_raster))
+
+  kde_raster <- resample(kde_raster, ref_raster, method = "bilinear")
+  kde_raster <- mask(kde_raster, ref_raster)
+
+  # Normalize to probabilities
+  vals <- values(kde_raster)
+  vals[is.na(vals)] <- 0
+  kde_raster[] <- vals / sum(vals, na.rm = TRUE)
+
+  return(kde_raster)
+}
+```
+
+
+
+6.5 Main background sampling loop
+```{r}
+# 🔹 Main loop
+species_results1 <- list()
+
+for (species in names(userOccs_Cl)) {
+  message("Processing: ", species)
+
+  # Clean occurrences
+  occs_Cl <- userOccs_Cl[[species]]$cleaned
+  occs_xy_Cl <- occs_Cl[, c('longitude', 'latitude')]
+  occs_vals_Cl <- as.data.frame(raster::extract(envs_Cl, occs_xy_Cl, cellnumbers = TRUE))
+  
+  occs_Cl <- occs_Cl[!duplicated(occs_vals_Cl[, 1]), ]
+  occs_vals_Cl <- occs_vals_Cl[!duplicated(occs_vals_Cl[, 1]), -1]
+  occs_Cl <- occs_Cl[!(rowSums(is.na(occs_vals_Cl)) >= 1), ]
+  occs_vals_Cl <- na.omit(occs_vals_Cl)
+  occs_Cl <- cbind(occs_Cl, occs_vals_Cl)
+
+  # Assign region shapefile
+  region_name <- species_region[species]
+  boundary_shape <- region_shapefiles[[region_name]]
+  boundary_shape <- st_transform(boundary_shape, crs(envs_Cl))
+
+  # Convex hull + buffer
+  occ_hull <- st_convex_hull(st_union(st_as_sf(
+    occs_Cl, coords = c("longitude", "latitude"), crs = 4326
+  )))
+  occ_hull_buffered <- st_transform(
+    st_buffer(st_transform(occ_hull, crs(envs_Cl)), 50000), crs(envs_Cl)
+  )
+  occ_hull_buffered <- st_intersection(occ_hull_buffered, boundary_shape)
+
+  # Convert to extent polygon for masking
+  bgExt_raster <- as(extent(st_bbox(occ_hull_buffered)), "SpatialPolygons")
+  crs(bgExt_raster) <- crs(envs_Cl)
+
+  # Generate background mask
+  bgMask_Cl <- penvs_bgMask(
+    occs = occs_Cl, envs = envs_Cl, bgExt = bgExt_raster
+  )
+
+  ## -------------------------
+  ## Background sampling
+  ## -------------------------
+  if (species_bg_method[species] == "bias") {
+    # KDE bias corrected sampling
+    kde_raster <- make_bias_raster(
+      occs_xy = occs_Cl[, c("longitude", "latitude")],
+      ref_raster = bgMask_Cl[[1]],
+      bandwidth = 0.5
+    )
+
+    # Flatten KDE to avoid zero-weight areas
+    kde_vals <- values(kde_raster)
+    kde_vals[is.na(kde_vals)] <- 0
+   # inside the bias-corrected section
+flatten_power <- if (species == "Gulo_gulo") 0.6 else 0.4
+kde_vals <- kde_vals^flatten_power
+kde_raster[] <- kde_vals / sum(kde_vals, na.rm = TRUE)
+
+
+    # Sample proportional to KDE
+    bg_cells <- sample(
+      which(!is.na(values(kde_raster))),
+      size = 10000,
+      prob = values(kde_raster)[!is.na(values(kde_raster))],
+      replace = TRUE
+    )
+    bg_coords <- xyFromCell(kde_raster, bg_cells)
+    bgSample_Cl <- as.data.frame(bg_coords)
+    colnames(bgSample_Cl) <- c("longitude", "latitude")
+
+  } else {
+    # Uniform region sampling
+    bgSample_Cl <- as.data.frame(randomPoints(
+      mask = bgMask_Cl[[1]],
+      n = 10000,
+      ext = bgExt_raster,
+      extf = 1.0
+    ))
+    colnames(bgSample_Cl) <- c("longitude", "latitude")
+    kde_raster <- NULL
+  }
+
+  # Partition occurrences
+  groups_Cl <- part_partitionOccs(
+    occs = occs_Cl,
+    bg = bgSample_Cl,
+    method = "block",
+    bgMask = bgMask_Cl,
+    aggFact = 2
+  )
+
+  # Extract background values
+  bgEnvsVals_Cl <- as.data.frame(raster::extract(bgMask_Cl, bgSample_Cl))
+  rownames(bgEnvsVals_Cl) <- NULL
+  bgEnvsVals_Cl <- cbind(
+    scientific_name = paste0("bg_", species),
+    bgSample_Cl,
+    occID = NA, year = NA, institution_code = NA, country = NA,
+    state_province = NA, locality = NA, elevation = NA,
+    record_type = NA, bgEnvsVals_Cl
+  )
+
+  # Save results
+  species_results1[[species]] <- list(
+    occurrences = occs_Cl,
+    background  = bgEnvsVals_Cl,
+    partitions  = groups_Cl,
+    bgMask      = bgMask_Cl,
+    biasRaster  = kde_raster
+  )
+}
+
+
+```
+
+
+7. Model forloop with all rms and custom L vs. LQ
+```{r}
+species_models1 <- list()
+small_sample_species <- c("Mustela_haidarum", "Spilogale_gracilis", "Mustela_nivalis")
+rm_values <- c(2,3,4)
+
+for (species in names(species_results1)) {
+  message("Processing: ", species)
+
+  # Extract prepared data
+  occs_Cl <- species_results1[[species]]$occurrences
+  bgEnvsVals_Cl <- species_results1[[species]]$background
+  groups_Cl <- species_results1[[species]]$partitions
+  bgMask_Cl <- species_results1[[species]]$bgMask
+
+  if (is.null(bgMask_Cl)) {
+    message("⚠ Skipping ", species, " because bgMask_Cl is NULL")
+    next
+  }
+
+  # Optional: sample background for plotting/evaluation
+  bgSample_Cl <- penvs_bgSample(
+    occs = occs_Cl,
+    bgMask = bgMask_Cl,
+    bgPtsNum = 20000
+  )
+
+  if (is.null(bgSample_Cl) || nrow(bgSample_Cl) == 0) {
+    message("⚠ Skipping ", species, " due to missing background points")
+    next
+  }
+
+  # Determine feature classes dynamically
+  fcs_value <- if (species %in% small_sample_species) "L" else "LQ"
+
+  # Run MaxEnt model with all RM values
+  model_Cl <- model_maxent(
+    occs = occs_Cl,
+    bg = bgEnvsVals_Cl,
+    user.grp = groups_Cl,
+    bgMsk = bgMask_Cl,
+    rms = rm_values,   # all RM values tested
+    fcs = fcs_value,
+    clampSel = TRUE,
+    algMaxent = "maxnet",
+    parallel = FALSE,
+    numCores = 27
+  )
+
+  species_models1[[species]] <- model_Cl
+}
+
+print(lapply(species_models1, class))
+
+```
+
+
+
+8. Extract and save AUC model results
+```{r}
+# Initialize storage for AUC values
+species_auc_list <- list()
+
+# Loop through each species
+for (species in names(species_models1)) {
+  model <- species_models1[[species]]
+  
+  # Ensure results exist
+  if (!is.null(model@results) && "auc.val.avg" %in% colnames(model@results)) {
+    
+    # Extract all models' AUC values
+    auc_vals <- data.frame(
+      fc = model@results$fc,
+      rm = model@results$rm,
+      auc_train = model@results$auc.train,  # Training AUC
+      auc_val = model@results$auc.val.avg,  # Validation AUC
+      delta_AICc = model@results$delta.AICc,  # AICc delta for model selection
+      w_AIC = model@results$w.AIC  # Model weight (lower AICc = better model)
+    )
+    
+    # Store all model results per species
+    species_auc_list[[species]] <- auc_vals
+  } else {
+    species_auc_list[[species]] <- NA  # Handle missing data
+  }
+}
+
+# Convert list to a single dataframe
+auc_df <- do.call(rbind, Map(data.frame, species = names(species_auc_list), results = species_auc_list))
+
+# Print and save results
+print(auc_df)
+write.csv(auc_df, "Output_tables/MaxEnt_AUC_Comparison_Nov25.csv", row.names = FALSE)
+
+
+
+```
+
+9. Extract environmental covariate values
+```{r}
+
+# Create an empty list to store variable importance
+coeff_summary <- list()
+
+# Loop through each species to extract the best model's coefficients
+for (species in names(species_models1)) {
+  
+  model <- species_models1[[species]]
+  
+  # Identify the top model (e.g., based on AICc or AUC)
+  top_model <- model@models[[which.max(model@results$auc.val.avg)]]
+  
+  # Extract environmental variable names and their corresponding coefficients (betas)
+  if (!is.null(top_model) && "betas" %in% names(top_model)) {
+    betas <- top_model$betas  # Extract coefficients
+    
+    # Store the betas with variable names as a data frame
+    coeff_df <- data.frame(
+      Variable = names(betas),
+      Beta_Coefficient = betas,
+      Species = species
+    )
+    
+    coeff_summary[[species]] <- coeff_df
+  } else {
+    message("No betas found for species: ", species)
+  }
+}
+
+# Combine all species' results into a single data frame
+coeff_summary_df <- do.call(rbind, coeff_summary)
+
+print(coeff_summary_df)
+
+write.csv(coeff_summary_df, file="Output_tables/coeff_summary_bioclim_all_Nov2025.csv")
+
+```
+
+10. Plot and save the top model beta coefficients for each species in a multi panel plot
+```{r}
+
+# Create output directory for plots if it doesn't exist
+output_dir <- "Output_multi_panels"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# Define lookup vectors
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+
+# Lookup vector
+species_lookup <- setNames(common_names, sci_names)
+
+# Load your data
+coeff_summary_df <- read.csv("Output_tables/coeff_summary_bioclim_all_Nov2025.csv")
+
+
+# Replace underscores and create common name column
+coeff_summary_df <- coeff_summary_df %>%
+  mutate(
+    SciName = gsub("_", " ", Species),
+    Species_common_name = species_lookup[SciName]
+  ) %>%
+  filter(!is.na(Species_common_name))
+
+# Optional: Order species alphabetically for facets
+coeff_summary_df <- coeff_summary_df %>%
+  mutate(Species_common_name = factor(Species_common_name, levels = sort(unique(Species_common_name))))
+
+
+# Lookup for BIOCLIM variable short names
+bioclim_lookup <- setNames(paste0("Bio", 1:19), paste0("bioclim.", 1:19))
+
+coeff_summary_df <- coeff_summary_df %>%
+  mutate(
+    # Clean quadratic terms first: I(bioclim.1^2) → bioclim.1^2
+    Variable = str_replace(Variable, "I\\((.*)\\^2\\)", "\\1^2"),
+    
+    # Replace bioclim.* with BioN
+    Variable = str_replace_all(Variable, bioclim_lookup),
+    
+    # Rename specific non-bioclim variables
+    Variable = recode(
+      Variable,
+      "pav_dens_10k" = "Road density",
+      "dist_water"   = "Dist. to water",
+      "pav_dens_10k^2" = "Road density^2",
+      "dist_water^2" = "Dist. to water^2"
+    )
+  )
+
+
+# 1. Get top N variables (e.g., 5) with the highest absolute beta per species
+# 1. Top N variables by absolute beta
+top_n <- 8
+
+coeff_top <- coeff_summary_df %>%
+  mutate(abs_beta = abs(Beta_Coefficient)) %>%
+  group_by(Species_common_name) %>%
+  slice_max(order_by = abs_beta, n = top_n, with_ties = FALSE) %>%
+  ungroup()
+
+# 2. Reorder variables within facets
+coeff_top <- coeff_top %>%
+  group_by(Species_common_name) %>%
+  mutate(Variable = fct_reorder(Variable, Beta_Coefficient)) %>%
+  ungroup()
+
+beta_coeff_plot <- ggplot(coeff_top, aes(x = Variable, y = Beta_Coefficient, fill = Beta_Coefficient > 0)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed", linewidth = 0.6) +
+  scale_fill_manual(values = c("TRUE" = "#2c7bb6", "FALSE" = "#3c9aa3")) +
+  coord_flip() +
+  ggh4x::facet_wrap2(~ Species_common_name, scales = "free", axes = "all") +
+  labs(
+    x = "Environmental Variable",
+    y = "Beta coefficient value",
+    title = "Top Model Beta coefficients by Species"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "grey20"),
+    axis.ticks = element_line(color = "grey20"),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+
+beta_coeff_plot
+
+ggsave(
+  filename = file.path(output_dir, "Beta_coeff_plot/Top_Beta_Coefficients_by_Species.png"),
+  plot = beta_coeff_plot,
+  width = 12, height = 8, dpi = 300
+)
+```
+
+11. Plot and save variable importance 
+
+```{r}
+make_model_vars_full <- function(df_raw, model_vars) {
+  out <- df_raw
+  
+  # Extract squared terms in model_vars
+  sq_vars <- grep("^I\\(([^)]+)\\^2\\)$", model_vars, value = TRUE)
+  sq_base_vars <- sub("^I\\(([^)]+)\\^2\\)$", "\\1", sq_vars)
+  
+  # Add squared terms only if base var exists in df_raw
+  for (sq_var in sq_vars) {
+    base_var <- sub("^I\\(([^)]+)\\^2\\)$", "\\1", sq_var)
+    if (base_var %in% names(df_raw)) {
+      out[[sq_var]] <- df_raw[[base_var]]^2
+    } else {
+      warning("Missing base var '", base_var, "' for squared var '", sq_var, "'")
+      out[[sq_var]] <- NA
+    }
+  }
+  
+  # Now ensure columns:
+  # 1. All original base variables from df_raw (i.e. names(df_raw))
+  # 2. Plus only squared terms used in the model_vars (sq_vars)
+  base_vars_in_raw <- names(df_raw)
+  
+  # Combine keeping order: base vars first, then squared vars in model_vars order
+  final_vars <- c(base_vars_in_raw, sq_vars)
+  
+  # Keep only these columns
+  out[, final_vars, drop = FALSE]
+}
+
+
+# Function to compute permutation importance
+get_permutation_importance <- function(model, envs, occs_env, bg_env) {
+  # DEBUG
+  missing_vars <- setdiff(names(model$betas), colnames(envs))
+  if (length(missing_vars) > 0) {
+    stop("Missing variables in envs: ", paste(missing_vars, collapse = ", "))
+  }
+
+  full_preds <- predict(model, as.data.frame(envs), type = "logistic")
+
+  labels <- c(rep(1, nrow(occs_env)), rep(0, nrow(bg_env)))
+
+  auc_full <- tryCatch({
+    pROC::roc(labels, full_preds)$auc
+  }, error = function(e) return(NA))
+
+  if (is.na(auc_full)) return(rep(NA, ncol(envs)))
+
+  perm_importance <- numeric(ncol(envs))
+  names(perm_importance) <- colnames(envs)
+
+  for (i in seq_along(perm_importance)) {
+    perm_envs <- envs
+    perm_envs[, i] <- sample(perm_envs[, i])
+    perm_preds <- predict(model, as.data.frame(perm_envs), type = "logistic")
+
+    perm_auc <- tryCatch({
+      pROC::roc(labels, perm_preds)$auc
+    }, error = function(e) return(auc_full))
+
+    perm_importance[i] <- auc_full - perm_auc
+  }
+
+  perm_importance[perm_importance < 0] <- 0
+  perm_importance / sum(perm_importance)
+}
+
+# Main loop for permutation importance by species
+importance_list <- list()
+
+for (species in names(species_models1)) {
+  message("Calculating importance for: ", species)
+  model_obj <- species_models1[[species]]
+  if (is.null(model_obj)) next
+
+  eval_tbl <- model_obj@results
+  best_idx <- which.min(eval_tbl$AICc)
+  model <- model_obj@models[[best_idx]]
+
+ vars <- names(model$betas)
+
+# Separate squared and base vars
+squared_vars <- grep("^I\\(([^)]+)\\^2\\)$", vars, value = TRUE)
+base_vars <- unique(c(
+  sub("^I\\(([^)]+)\\^2\\)$", "\\1", squared_vars),
+  vars[!grepl("^I\\(", vars)]  # regular terms
+))
+
+# Extract coordinates
+occs_coords <- species_results1[[species]]$occurrences[, c("longitude", "latitude")]
+bg_coords   <- species_results1[[species]]$background[, c("longitude", "latitude")]
+
+# Extract raw env data
+occs_env_raw <- raster::extract(envs_Cl, occs_coords)
+bg_env_raw   <- raster::extract(envs_Cl, bg_coords)
+
+occs_env_raw <- as.data.frame(occs_env_raw)
+bg_env_raw   <- as.data.frame(bg_env_raw)
+
+# Remove rows with missing base vars
+occs_env_raw <- occs_env_raw[complete.cases(occs_env_raw[, base_vars, drop = FALSE]), ]
+bg_env_raw   <- bg_env_raw[complete.cases(bg_env_raw[, base_vars, drop = FALSE]), ]
+
+if (nrow(occs_env_raw) == 0 || nrow(bg_env_raw) == 0) {
+  warning("Skipping ", species, ": no complete rows for required base variables")
+  next
+}
+
+# Safely construct all needed model variables
+occs_env <- make_model_vars_full(occs_env_raw, vars)
+bg_env   <- make_model_vars_full(bg_env_raw, vars)
+
+# Check names - now occs_env should have all raw vars + squared terms
+print(names(occs_env))
+
+# Check again after construction
+if (any(sapply(occs_env, function(x) all(is.na(x)))) ||
+    any(sapply(bg_env, function(x) all(is.na(x))))) {
+  warning("Skipping ", species, ": NA columns present after var creation")
+  next
+}
+
+
+  # Combine occurrence and background env data for prediction
+  envs <- rbind(occs_env, bg_env)
+
+  if (nrow(envs) > 0) {
+    importance <- get_permutation_importance(model, envs, occs_env, bg_env)
+    importance_list[[species]] <- importance
+  }
+}
+
+# Combine into tidy dataframe for plotting
+importance_df <- bind_rows(lapply(names(importance_list), function(species) {
+  imp <- importance_list[[species]]
+  if (is.null(imp)) return(NULL)
+  tibble(
+    species = species,
+    variable = names(imp),
+    importance = imp * 100
+  )
+}), .id = NULL)
+
+# Order variables by mean importance across species
+var_order <- importance_df %>%
+  group_by(variable) %>%
+  summarise(mean_imp = mean(importance, na.rm = TRUE)) %>%
+  arrange(mean_imp) %>%
+  pull(variable)
+
+importance_df$variable <- factor(importance_df$variable, levels = var_order)
+
+importance_df_filtered <- importance_df %>%
+  filter(importance > 0)
+
+# Your species lookup table
+sci_names <- c(
+  "Canis_latrans", "Gulo_gulo", "Lontra_canadensis", "Lynx_canadensis", "Lynx_rufus",
+  "Martes_spp", "Mephitis_mephitis", "Mustela_richardsonii", "Mustela_haidarum",
+  "Mustela_nivalis", "Neogale_frenata", "Neogale_vison", "Pekania_pennanti", "Procyon_lotor",
+  "Spilogale_gracilis", "Taxidea_taxus", "Vulpes_vulpes"
+)
+
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+
+name_lookup <- data.frame(
+  species = sci_names,
+  species_common_name = common_names,
+  stringsAsFactors = FALSE
+)
+
+# Filter to keep only variables with importance > 0 and join common names
+importance_df_filtered <- importance_df %>%
+  filter(importance > 0) %>%
+  left_join(name_lookup, by = "species")
+
+
+imp_plot <- ggplot(importance_df_filtered, aes(x = variable, y = importance, fill = variable)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ species_common_name, scales = "free_y") +
+  scale_fill_viridis(discrete = TRUE, option = "D") +  # viridis palette for discrete variables
+  labs(
+    title = "Permutation Importance of Environmental Variables by Species",
+    x = "Environmental Variable",
+    y = "Importance (%)"
+  ) +
+  theme_light(base_size = 13) +
+theme(
+  strip.text = element_text(face = "bold", color = "black"),  # facet labels black
+  axis.text.y = element_text(size = 8),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "grey90")
+)
+ 
+imp_plot
+ 
+ggsave(
+  filename = file.path(output_dir, "Variable_importance/Variable_Importance_by_Species_Nov2025.png"),
+  plot = imp_plot,
+  width = 12, height = 8, dpi = 300
+)
+
+```
+
+
+12. Find the top important variables across species to create the density plot
+
+```{r}
+library(dplyr)
+importance_df_filtered_sp <- importance_df_filtered %>%
+  filter(species %in% c("Pekania_pennanti", "Lontra_canadensis", "Lynx_rufus"))
+                                      
+# Identify top 6 most important variables across all species
+top_vars <- importance_df_filtered_sp %>%
+  group_by(variable) %>%
+  summarise(mean_importance = mean(importance, na.rm = TRUE)) %>%
+  arrange(desc(mean_importance)) %>%
+  slice_head(n = 6) %>%
+  pull(variable)
+
+# Print the top variables
+print(top_vars)
+# [bioclim.1  bioclim.13 bioclim.5  bioclim.18 bioclim.6  bioclim.14 bioclim.2 bioclim.6 bioclim.11 elevation dist_water pav_dens_10k
+```
+
+
+13. Make a plot for a representative winner, neutral and loser species for top 3 most important variables.
+Using current model outputs
+
+```{r}
+# Define species and variables of interest
+target_species <- c("Pekania_pennanti", "Lynx_rufus", "Lontra_canadensis")
+target_vars <- c("bioclim.1", "bioclim.5", "bioclim.13", "elevation", "dist_water", "bioclim.18")
+
+# Lookup table for bioclim variable descriptions
+bioclim_lookup <- c(
+  bioclim.1 = "Annual mean temperature ◦C (bioclim.1)",
+  bioclim.2 = "Annual mean diurnal range ◦C (bioclim.2)",
+  bioclim.3 = "Isothermality (Bio2/Bio7) ×100",
+  bioclim.4 = "Temperature seasonality (SD ×100)",
+  bioclim.5 = "Max temperature ◦C of warmest month (bioclim.5)",
+  bioclim.6 = "Min temperature ◦C of coldest month  (bioclim.6)",
+  bioclim.7 = "Annual temperature range",
+  bioclim.8 = "Mean temperature of wettest quarter",
+  bioclim.9 = "Mean temperature of driest quarter",
+  bioclim.10 = "Mean temperature of warmest quarter",
+  bioclim.11 = "Mean temperature ◦C of coldest quarter (bioclim.11)",
+  bioclim.12 = "Annual precipitation",
+  bioclim.13 = "Precipitation (mm) of wettest month (bioclim.13)",
+  bioclim.14 = "Precipitation (mm) of driest month (bioclim.14)",
+  bioclim.15 = "Precipitation (mm) seasonality (bioclim.15)",
+  bioclim.16 = "Precipitation of wettest quarter",
+  bioclim.17 = "Precipitation of driest quarter",
+  bioclim.18 = "Precipitation (mm) of warmest quarter (bioclim.18)",
+  bioclim.19 = "Precipitation (mm) of coldest quarter (bioclim.19)",
+  elevation = "Elevation (m)",
+  dist_water = "Distance to water (m)"
+)
+
+# Custom species labels
+species_labels <- c(
+  "Pekania_pennanti" = "Net loss: Fisher",
+  "Lontra_canadensis" = "Neutral: North American river otter",
+  "Lynx_rufus" = "Net gain: Bobcat"
+)
+
+# Custom fill colors
+custom_colors <- c(
+  "Net loss: Fisher" = "turquoise4",
+  "Neutral: North American river otter" = "#fee08b",
+  "Net gain: Bobcat" = "#8B1E3F"
+)
+
+# Initialize list to store data
+env_data_list <- list()
+
+# Loop through each species and extract environmental data
+for (species in target_species) {
+  occs_df <- species_models1[[species]]@occs
+  
+  if (!all(target_vars %in% names(occs_df))) {
+    warning("Missing variables for species: ", species)
+    next
+  }
+  
+  env_df <- occs_df[, target_vars, drop = FALSE] %>%
+    mutate(species_common_name = species_labels[species])
+  
+  env_data_list[[species]] <- env_df
+}
+
+# Combine all species data
+env_data_combined <- bind_rows(env_data_list)
+
+# Reshape to long format for plotting
+env_data_long <- env_data_combined %>%
+  pivot_longer(cols = all_of(target_vars), names_to = "variable", values_to = "value") %>%
+  mutate(variable_label = bioclim_lookup[variable])
+
+# Plot: density plot with custom fill colors and labels
+dens_plot <- ggplot(env_data_long, aes(x = value, fill = species_common_name)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~ variable_label, scales = "free", ncol = 2) +
+  scale_fill_manual(values = custom_colors) +
+  labs(
+    title = "Environmental Variable Distributions for Selected Species",
+    x = "Value",
+    y = "Density",
+    fill = "Species"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+  strip.text = element_text(face = "bold"),
+  legend.position = "top",
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "grey95", color = NA),
+  plot.background = element_rect(fill = "grey95", color = NA),
+  axis.line = element_line(color = "black"),
+  axis.ticks = element_line(color = "black"),
+  axis.text = element_text(color = "black"),
+  axis.title = element_text(color = "black")
+)
+
+dens_plot
+
+ggsave(
+  filename = file.path(output_dir, "Environmental_Density_by_Species.png"),
+  plot = dens_plot,
+  width = 12, height = 8, dpi = 300
+)
+
+
+
+
+```
+
+
+14. Extract variable response curves by species
+
+```{r}
+
+# Function to generate response curve for one variable
+plot_response_curve <- function(model, variable, env_stack) {
+  # Get range of values from env_stack
+  env_vals <- values(env_stack[[variable]])
+  env_vals <- env_vals[!is.na(env_vals)]
+  rng <- range(env_vals)
+
+  # Create prediction dataframe with a sequence across range
+  pred_df <- data.frame(x = seq(rng[1], rng[2], length.out = 100))
+  names(pred_df) <- variable
+
+  # Add median values for all other variables
+  other_vars <- setdiff(names(env_stack), variable)
+  for (v in other_vars) {
+    pred_df[[v]] <- median(values(env_stack[[v]]), na.rm = TRUE)
+  }
+
+  # Predict
+  pred_df$prediction <- predict(model, pred_df, type = "cloglog")
+
+  # Plot
+  ggplot(pred_df, aes_string(x = variable, y = "prediction")) +
+    geom_line(linewidth = 1, color = "#2C7BB6") +
+    labs(y = "Habitat suitability", title = variable) +
+    theme_minimal(base_size = 12)
+}
+
+# Loop through all species
+for (sp in names(species_models1)) {
+  cat("Processing", sp, "\n")
+
+  # Get best model by lowest AICc
+  best_index <- which.min(species_models1[[sp]]@results$AICc)
+  best_model <- species_models1[[sp]]@models[[best_index]]
+
+  # Get top 5 variables based on coefficient magnitudes
+  coef_names <- names(best_model$coefficients)
+  coef_vals <- abs(best_model$coefficients)
+
+  # Strip transformation functions, keep raw variable names
+  raw_vars <- gsub(".*\\((.*)\\)", "\\1", coef_names)
+  var_importance <- tapply(coef_vals, raw_vars, sum)
+  top_vars <- names(sort(var_importance, decreasing = TRUE))[1:5]
+
+  # Plot top variable response curves
+  top_plots <- lapply(top_vars, function(v) {
+    plot_response_curve(best_model, v, envs_Cl)
+  })
+
+  # Combine and save
+  combined <- wrap_plots(top_plots, ncol = 2)
+
+  # Create species-specific folder if not exists
+  dir_create(file.path("response_curves", sp))
+
+  # Save
+  ggsave(
+    filename = file.path("response_curves", sp, paste0(sp, "_response_curves.png")),
+    plot = combined,
+    width = 10, height = 8, dpi = 300
+  )
+}
+
+
+
+```
+
+
+15. Plot selected species variable response curves (similar to occurrence density above)
+```{r}
+# Define species and variables
+target_species <- c("Pekania_pennanti", "Lynx_rufus", "Mustela_richardsonii")
+target_vars <- c("bioclim.1", "bioclim.6", "bioclim.14", "bioclim.13", "bioclim.5", "elevation")
+
+
+# Lookup table for bioclim variable descriptions
+bioclim_lookup <- c(
+  bioclim.1 = "Annual mean temperature ◦C (bioclim.1)",
+  bioclim.2 = "Annual mean diurnal range ◦C (bioclim.2)",
+  bioclim.3 = "Isothermality (Bio2/Bio7) ×100",
+  bioclim.4 = "Temperature seasonality (SD ×100)",
+  bioclim.5 = "Max temperature ◦C of warmest month (bioclim.5)",
+  bioclim.6 = "Min temperature ◦C of coldest month  (bioclim.6)",
+  bioclim.7 = "Annual temperature range",
+  bioclim.8 = "Mean temperature of wettest quarter",
+  bioclim.9 = "Mean temperature of driest quarter",
+  bioclim.10 = "Mean temperature of warmest quarter",
+  bioclim.11 = "Mean temperature ◦C of coldest quarter (bioclim.11)",
+  bioclim.12 = "Annual precipitation",
+  bioclim.13 = "Precipitation (mm) of wettest month (bioclim.13)",
+  bioclim.14 = "Precipitation (mm) of driest month (bioclim.14)",
+  bioclim.15 = "Precipitation (mm) seasonality (bioclim.15)",
+  bioclim.16 = "Precipitation of wettest quarter",
+  bioclim.17 = "Precipitation of driest quarter",
+  bioclim.18 = "Precipitation (mm) of warmest quarter (bioclim.18)",
+  bioclim.19 = "Precipitation (mm) of coldest quarter (bioclim.19)",
+  elevation = "Elevation (m)"
+)
+
+# Custom species labels and colors
+species_labels <- c(
+  "Pekania_pennanti" = "Net loss: Fisher",
+  "Mustela_richardsonii" = "Neutral: Short-tailed weasel",
+  "Lynx_rufus" = "Net gain: Bobcat"
+)
+
+custom_colors <- c(
+  "Net loss: Fisher" = "turquoise4",
+  "Neutral: Short-tailed weasel" = "#fee08b",
+  "Net gain: Bobcat" = "#8B1E3F"
+)
+
+# Function to generate response data for one variable and species
+generate_response_df <- function(model, variable, env_stack) {
+  # Get range
+  env_vals <- values(env_stack[[variable]])
+  env_vals <- env_vals[!is.na(env_vals)]
+  rng <- range(env_vals)
+
+  # Create data frame with values across the range
+  pred_df <- data.frame(value = seq(rng[1], rng[2], length.out = 100))
+  names(pred_df)[1] <- variable  # Rename to match the variable name
+
+  # Add median values for other predictors
+  other_vars <- setdiff(names(env_stack), variable)
+  for (v in other_vars) {
+    pred_df[[v]] <- median(values(env_stack[[v]]), na.rm = TRUE)
+  }
+
+  # Predict
+  pred_df$prediction <- predict(model, pred_df, type = "cloglog")
+  
+  # Add metadata
+  pred_df$variable <- variable
+  pred_df$value <- pred_df[[variable]]  # Ensure 'value' is the predictor value
+  pred_df
+}
+
+
+# Combine all data
+all_response_data <- list()
+
+for (sp in target_species) {
+  cat("Processing", sp, "\n")
+  
+  # Get best model
+  best_index <- which.min(species_models1[[sp]]@results$AICc)
+  best_model <- species_models1[[sp]]@models[[best_index]]
+  
+  # Loop through target variables
+  for (var in target_vars) {
+    resp_df <- generate_response_df(best_model, var, envs_Cl)
+    resp_df$species <- species_labels[sp]
+    all_response_data[[paste(sp, var, sep = "_")]] <- resp_df
+  }
+}
+occ_preds_list <- list()
+
+for (sp in target_species) {
+  best_index <- which.min(species_models1[[sp]]@results$AICc)
+  best_model <- species_models1[[sp]]@models[[best_index]]
+  
+occ_data <- species_models1[[sp]]@occs
+occ_data <- occ_data[, intersect(names(occ_data), target_vars), drop = FALSE]
+  occ_data$prediction <- predict(best_model, occ_data, type = "cloglog")
+  occ_data$species <- species_labels[sp]
+  
+  occ_long <- occ_data %>%
+    pivot_longer(cols = all_of(target_vars), names_to = "variable", values_to = "value") %>%
+    mutate(variable_label = bioclim_lookup[variable])
+  
+  occ_preds_list[[sp]] <- occ_long
+}
+
+occ_preds_combined <- bind_rows(occ_preds_list)
+
+# Optional: read occurrence data from each model object
+occ_data_list <- lapply(target_species, function(sp) {
+  occ <- species_models1[[sp]]@occs[, target_vars, drop = FALSE]
+  occ$species <- species_labels[sp]
+  occ
+})
+occ_data_long <- bind_rows(occ_data_list) %>%
+  pivot_longer(cols = all_of(target_vars), names_to = "variable", values_to = "value") %>%
+  mutate(variable_label = bioclim_lookup[variable])
+
+# Combine and label
+response_combined <- bind_rows(all_response_data)
+response_combined$variable_label <- bioclim_lookup[response_combined$variable]
+
+p <-ggplot(response_combined, aes(x = value, y = prediction, color = species)) +
+  geom_line(linewidth = 1.2) +
+geom_point(
+  data = occ_preds_combined,
+  aes(x = value, y = prediction, color = species),
+  alpha = 0.5, size = 1.5, inherit.aes = FALSE
+)+
+  facet_wrap(~ variable_label, scales = "free", ncol = 2) +
+  scale_color_manual(
+    values = custom_colors,
+    breaks = c("Net gain: Bobcat", "Neutral: Short-tailed weasel", "Net loss: Fisher")
+  ) +
+  labs(
+    title = "Maxent Response Curves",
+    x = "Environmental value",
+    y = "Climate suitability",
+    color = "Species"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "grey95", color = NA),
+    plot.background = element_rect(fill = "grey95", color = NA),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black")
+  )
+
+
+print(p)
+
+
+ggsave(
+  filename = file.path(output_dir, "Response_curves_by_Species.png"),
+  plot = p,
+  width = 12, height = 8, dpi = 300
+)
+```
+
+
+16. Export Baseline Climate Rasters *Modified to generate rasters using MESS & a -5 threshold to match future layers AND apply top model*
+```{r}
+# -----------------------------
+# Output directory
+# -----------------------------
+output_dir <- "Output_rasters_maps/SDM_current/Maxent_Bioclim_BiasCor-5_rm2_thinned"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --- Set MESS threshold here ---
+mess_threshold <- -5  # change to 0, -10, etc.
+
+# -----------------------------
+# Load region shapefiles
+# -----------------------------
+bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>%
+  st_transform(4326)
+
+bc_main <- st_read("Input_GIS/BC_mainland.shp") %>% st_transform(4326)
+haida_gwaii <- st_read("Input_GIS/Haida_Gwaii.shp") %>% st_transform(4326)
+van_isle <- st_read("Input_GIS/Vancouver_island.shp") %>% st_transform(4326)
+bc_isle_main <- st_read("Input_GIS/BC_vanisle_main.shp") %>% st_transform(4326)
+
+region_shapefiles <- list(
+  bc_boundary = bc_boundary,
+  bc_main = bc_main,
+  haida_gwaii = haida_gwaii,
+  van_isle = van_isle,
+  bc_isle_main = bc_isle_main
+)
+
+species_region <- c(
+  "Taxidea_taxus" = "bc_main",
+  "Lynx_rufus" = "bc_main",
+  "Vulpes_vulpes" = "bc_main",      
+  "Lynx_canadensis" = "bc_main",
+  "Pekania_pennanti" = "bc_main",
+  "Canis_latrans" = "bc_main",
+  "Martes_spp" = "bc_boundary",
+  "Mustela_haidarum" = "haida_gwaii",
+  "Neogale_vison" = "bc_boundary",
+  "Mustela_nivalis" = "bc_main",
+  "Neogale_frenata" = "bc_main",
+  "Lontra_canadensis" = "bc_boundary",
+  "Procyon_lotor" = "bc_boundary", 
+  "Mephitis_mephitis" = "bc_main",
+  "Spilogale_gracilis" = "bc_main",
+  "Gulo_gulo" = "bc_main",
+  "Mustela_richardsonii" = "bc_isle_main")
+
+# -----------------------------
+# Create lookup of best models
+# -----------------------------
+species_auc_list <- list()
+
+for (species in names(species_models1)) {
+  model <- species_models1[[species]]
+  
+  if (!is.null(model@results) && "auc.val.avg" %in% colnames(model@results)) {
+    auc_vals <- data.frame(
+      fc = model@results$fc,
+      rm = model@results$rm,
+      auc_train = model@results$auc.train,
+      auc_val = model@results$auc.val.avg,
+      delta_AICc = model@results$delta.AICc,
+      w_AIC = model@results$w.AIC
+    )
+    species_auc_list[[species]] <- auc_vals
+  } else {
+    species_auc_list[[species]] <- NA
+  }
+}
+
+best_models <- lapply(names(species_auc_list), function(sp) {
+  df <- species_auc_list[[sp]]
+  if (is.null(df) || all(is.na(df))) return(NULL)
+  best_row <- df[which.min(df$delta_AICc), ]   # change criterion if needed
+  data.frame(
+    species = sp,
+    fc = best_row$fc,
+    rm = best_row$rm,
+    stringsAsFactors = FALSE
+  )
+})
+best_models_df <- do.call(rbind, best_models)
+write.csv(best_models_df, "BestModels_lookup.csv", row.names = FALSE)
+
+# -----------------------------
+# Raster generation loop
+# -----------------------------
+for (species in names(species_results1)) {
+  try({
+    message("🦝 Generating regional raster with MESS mask for: ", species)
+
+    if (!species %in% names(species_models1)) {
+      message("⚠ Skipping ", species, ": no model found.")
+      next
+    }
+
+    # Look up best fc/rm for this species
+bm <- best_models_df[best_models_df$species == species, ]
+    if (nrow(bm) == 0) {
+      message("⚠ Skipping ", species, ": no entry in lookup table.")
+      next
+    }
+    fc_val <- bm$fc[1]
+    rm_val <- bm$rm[1]
+    model_name <- paste0("fc.", fc_val, "_rm.", rm_val)
+
+    if (!model_name %in% names(species_models1[[species]]@models)) {
+      message("⚠ Skipping ", species, ": model ", model_name, " not found in @models.")
+      next
+    }
+    m_Cl <- species_models1[[species]]@models[[model_name]]
+
+    # Get variable names used in model
+    model_vars <- names(m_Cl$betas)
+    model_vars_raw <- unique(gsub(".*\\(|\\^.*|\\)", "", model_vars))
+
+    if (!all(model_vars_raw %in% names(envs_Cl))) {
+      missing_vars <- setdiff(model_vars_raw, names(envs_Cl))
+      message("⚠ Skipping ", species, ": missing variables in raster stack: ", paste(missing_vars, collapse = ", "))
+      next
+    }
+    envs_used <- subset(envs_Cl, model_vars_raw)
+
+    # Predict habitat suitability
+    pred_bc <- raster::predict(envs_used, m_Cl, type = "logistic", clamp = TRUE,
+                               filename = tempfile(fileext = ".grd"), overwrite = TRUE)
+
+    # Regional mask
+    region_name <- species_region[[species]]
+    region_sf <- region_shapefiles[[region_name]]
+    if (is.null(region_sf)) {
+      message("⚠ Skipping ", species, ": no region shapefile found for ", region_name)
+      next
+    }
+    region_sp <- as_Spatial(region_sf)
+    bc_sp <- as_Spatial(bc_boundary)
+
+    pred_masked_region <- mask(pred_bc, region_sp)
+    zero_raster <- setValues(pred_bc, 0)
+    pred_with_zeros <- cover(pred_masked_region, zero_raster)
+    pred_full_bc <- mask(pred_with_zeros, bc_sp)
+
+    # Extract training values for MESS
+    presence_coords <- species_results1[[species]]$occurrences[, c("longitude", "latitude")]
+    train_vals <- try(raster::extract(envs_used, presence_coords), silent = TRUE)
+    if (inherits(train_vals, "try-error") || is.null(train_vals)) {
+      message("⚠ Skipping ", species, ": failed to extract training values.")
+      next
+    }
+    train_vals <- train_vals[complete.cases(train_vals), ]
+    if (nrow(train_vals) < 10) {
+      message("⚠ Skipping ", species, ": too few complete training points for MESS.")
+      next
+    }
+
+    # Filter predictors with variance > 0
+    col_stats <- sapply(seq_len(ncol(train_vals)), function(i) {
+      col_data <- train_vals[, i]
+      n_non_na <- sum(!is.na(col_data))
+      var_val <- if (n_non_na > 1) var(col_data, na.rm = TRUE) else NA
+      c(n_non_na = n_non_na, variance = var_val)
+    })
+    col_stats_df <- as.data.frame(t(col_stats))
+    rownames(col_stats_df) <- names(envs_used)
+    good_cols <- which(!is.na(col_stats_df$variance) & col_stats_df$variance > 0)
+
+    if (length(good_cols) < 2) {
+      message("⚠ Skipping ", species, ": too few valid predictors after variance filtering.")
+      next
+    }
+    train_vals_filtered <- train_vals[, good_cols, drop = FALSE]
+    envs_used_filtered <- subset(envs_used, names(envs_used)[good_cols])
+
+    mess_map <- tryCatch({
+      dismo::mess(envs_used_filtered, train_vals_filtered)
+    }, error = function(e) {
+      message("⚠ Skipping ", species, ": MESS calculation failed - ", e$message)
+      return(NULL)
+    })
+    if (is.null(mess_map)) next
+
+    # Create MESS dir
+    mess_dir <- file.path(output_dir, "MESS_masks")
+    dir.create(mess_dir, showWarnings = FALSE, recursive = TRUE)
+
+    mess_raw_filename <- file.path(mess_dir, paste0(species, "_MESS_raw_", region_name, ".tif"))
+    writeRaster(mess_map, mess_raw_filename, format = "GTiff", overwrite = TRUE)
+
+    mess_binary <- mess_map >= mess_threshold
+    names(mess_binary) <- paste0(species, "_MESSmask")
+    mess_bin_filename <- file.path(mess_dir, paste0(species, "_MESS_binary_", region_name, ".tif"))
+    writeRaster(mess_binary, mess_bin_filename, format = "GTiff", overwrite = TRUE)
+
+    pred_full_bc[mess_map < mess_threshold] <- NA
+
+    raster_filename <- file.path(output_dir, paste0(species, "_capability_biascor_MESS", ".tif"))
+
+    pred_proj <- terra::project(
+  terra::rast(pred_full_bc),
+  "EPSG:3005",
+  method = "bilinear",
+  filename = raster_filename,
+  overwrite = TRUE
+)
+
+    message("✅ Saved MESS-masked prediction for ", species)
+
+    rm(pred_bc, pred_masked_region, zero_raster, pred_with_zeros,
+       pred_full_bc, mess_map, pred_proj)
+    gc()
+
+  }, silent = FALSE)
+}
+
+
+```
+
+
+17. Alternatively - Generate rasters using MESS integrated AND Convex Hull
+
+```{r}
+# ==============================
+# Output directory
+# ==============================
+setwd("C:/LocalR/SDM_mesocarnivores")
+output_dir <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data/3. Maxent/2. HTML_Raster_Maps/SDM_rasters/Maxent_Bioclim_BiasCorMesshull"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ==============================
+# Regional shapefiles
+# ==============================
+bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>%
+  dplyr::filter(name == "British Columbia") %>%
+  st_transform(4326)
+
+bc_main      <- st_read("Input_GIS/BC_mainland.shp") %>% st_transform(4326)
+haida_gwaii  <- st_read("Input_GIS/Haida_Gwaii.shp") %>% st_transform(4326)
+van_isle     <- st_read("Input_GIS/Vancouver_island.shp") %>% st_transform(4326)
+bc_isle_main <- st_read("Input_GIS/BC_vanisle_main.shp") %>% st_transform(4326)
+
+region_shapefiles <- list(
+  bc_boundary   = bc_boundary,
+  bc_main       = bc_main,
+  haida_gwaii   = haida_gwaii,
+  van_isle      = van_isle,
+  bc_isle_main  = bc_isle_main
+)
+
+# ==============================
+# Region assignment per species
+# ==============================
+species_region <- c(
+  "Taxidea_taxus"        = "bc_main",
+  "Lynx_rufus"           = "bc_main",
+  "Vulpes_vulpes"        = "bc_main",
+  "Lynx_canadensis"      = "bc_main",
+  "Pekania_pennanti"     = "bc_main",
+  "Canis_latrans"        = "bc_main",
+  "Martes_spp"           = "bc_boundary",
+  "Mustela_haidarum"     = "haida_gwaii",
+  "Neogale_vison"        = "bc_boundary",
+  "Mustela_nivalis"      = "bc_main",
+  "Neogale_frenata"      = "bc_main",
+  "Lontra_canadensis"    = "bc_boundary",
+  "Procyon_lotor"        = "bc_boundary",
+  "Mephitis_mephitis"    = "bc_main",
+  "Spilogale_gracilis"   = "bc_main",
+  "Gulo_gulo"            = "bc_main",
+  "Mustela_richardsonii" = "bc_isle_main",
+  "Tamiasciurus_hudsonicus" = "bc_main"
+)
+
+# ==============================
+# Convex hull buffer (m) — if used
+# ==============================
+species_buffers <- c(
+  "Taxidea_taxus"        = 100000,
+  "Lynx_rufus"           = 100000,
+  "Vulpes_vulpes"        = 50000,
+  "Lynx_canadensis"      = 50000,
+  "Pekania_pennanti"     = 50000,
+  "Canis_latrans"        = 50000,
+  "Martes_spp"           = 50000,
+  "Mustela_haidarum"     = 50000,
+  "Neogale_vison"        = 50000,
+  "Mustela_nivalis"      = 50000,
+  "Neogale_frenata"      = 50000,
+  "Lontra_canadensis"    = 50000,
+  "Procyon_lotor"        = 50000, 
+  "Mephitis_mephitis"    = 50000,
+  "Spilogale_gracilis"   = 50000,
+  "Gulo_gulo"            = 50000,
+  "Mustela_richardsonii" = 50000
+)
+
+# ==============================
+# Which species get a convex hull mask?
+# ==============================
+species_use_hull <- c(
+  "Taxidea_taxus"        = FALSE,
+  "Lynx_rufus"           = FALSE,
+  "Vulpes_vulpes"        = FALSE,
+  "Lynx_canadensis"      = FALSE,
+  "Pekania_pennanti"     = FALSE,
+  "Canis_latrans"        = FALSE,
+  "Martes_spp"           = FALSE,
+  "Mustela_haidarum"     = FALSE,  
+  "Neogale_vison"        = FALSE,  
+  "Mustela_nivalis"      = FALSE,
+  "Neogale_frenata"      = FALSE,
+  "Lontra_canadensis"    = FALSE,  
+  "Procyon_lotor"        = FALSE,  
+  "Mephitis_mephitis"    = FALSE,
+  "Spilogale_gracilis"   = FALSE,
+  "Gulo_gulo"            = FALSE,
+  "Mustela_richardsonii"  = FALSE
+)
+
+# ==============================
+# Main loop
+# ==============================
+for (species in names(species_results1)) {
+  try({
+    message("🦝 Generating raster for: ", species)
+
+    if (!species %in% names(species_models1)) {
+      message("⚠ Skipping ", species, ": no model found.")
+      next
+    }
+
+    model_Cl <- species_models1[[species]]
+    m_Cl <- model_Cl@models[["fc.LQ_rm.2"]]
+
+    model_vars <- names(m_Cl$betas)
+    model_vars_raw <- unique(gsub(".*\\(|\\^.*|\\)", "", model_vars))
+
+    if (!all(model_vars_raw %in% names(envs_Cl))) {
+      missing_vars <- setdiff(model_vars_raw, names(envs_Cl))
+      message("⚠ Skipping ", species, ": missing variables: ", paste(missing_vars, collapse = ", "))
+      next
+    }
+
+    envs_used <- subset(envs_Cl, model_vars_raw)
+
+    # --- Predict ---
+    pred_raster <- raster::predict(envs_used, m_Cl, type = "logistic", clamp = TRUE,
+                                   filename = tempfile(fileext = ".grd"), overwrite = TRUE)
+
+    # --- MESS mask ---
+    presence_coords <- species_results1[[species]]$occurrences[, c("longitude", "latitude")]
+    train_vals <- raster::extract(envs_used, presence_coords)
+    train_vals <- train_vals[complete.cases(train_vals), ]
+    mess_map <- dismo::mess(envs_used, train_vals)
+    pred_raster[mess_map < 0] <- NA
+
+    # --- Region ---
+    region_name <- species_region[[species]]
+    region_sf   <- region_shapefiles[[region_name]]
+    region_sf   <- st_transform(region_sf, crs(envs_Cl))
+
+    # --- Convex hull (optional) ---
+    if (species_use_hull[[species]]) {
+      occ_sf <- st_as_sf(species_results1[[species]]$occurrences,
+                         coords = c("longitude", "latitude"), crs = 4326)
+      hull <- st_convex_hull(st_union(occ_sf))
+      buffer_dist <- species_buffers[species]
+      hull_buf <- st_buffer(st_transform(hull, crs(envs_Cl)), buffer_dist)
+
+      hull_buf <- st_intersection(hull_buf, region_sf)
+      hull_buf_sp <- as_Spatial(hull_buf)
+
+      pred_raster <- mask(pred_raster, hull_buf_sp)
+
+      rm(hull, hull_buf, hull_buf_sp)
+    }
+
+    # --- Always apply region mask ---
+    pred_raster <- mask(pred_raster, as_Spatial(region_sf))
+
+    # --- Save ---
+    raster_filename <- file.path(output_dir, paste0(species, "_Maxent_Bias_MESS_Hull.tif"))
+    writeRaster(pred_raster, raster_filename, format = "GTiff", overwrite = TRUE)
+
+    message("✅ Saved raster for ", species)
+
+    rm(pred_raster, mess_map, region_sf)
+    gc()
+
+  }, silent = FALSE)
+}
+
+
+```
+
+18. Plot the Multi panel with MESS rasters
+```{r}
+# Define raster directory
+raster_dir <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data/3. Maxent/2. HTML_Raster_Maps/SDM_rasters/Maxent_Bioclim_MixBiased-5_rm2_thinned"
+
+# List raster files
+raster_paths <- list.files(raster_dir, pattern = "\\.tif$", full.names = TRUE)
+
+# Extract scientific names from filenames
+species_sci <- basename(raster_paths) %>%
+  str_remove("_capability_.*\\.tif$") %>%
+  str_replace_all("_", " ")
+
+# Lookup table of scientific to common names
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+
+# Create lookup table
+name_lookup <- data.frame(
+  species = sci_names,
+  species_common_name = common_names,
+  stringsAsFactors = FALSE
+)
+
+# Join raster paths with species names
+raster_df <- data.frame(path = raster_paths, species = species_sci, stringsAsFactors = FALSE) %>%
+  left_join(name_lookup, by = "species") %>%
+  arrange(species_common_name)  # Alphabetical ordering by common name
+
+# Load BC boundary in EPSG:3005
+bc_boundary <- rnaturalearth::ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>%
+  st_transform(3005)
+
+make_sdm_plot <- function(rast_path, species_label) {
+  r <- raster(rast_path)
+
+  # Reproject to BC Albers (EPSG:3005)
+  r_proj <- projectRaster(r, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+
+  if (species_label == "Haida ermine") {
+    # Reproject Haida Gwaii shapefile to match raster
+    haida_gwaii_proj <- st_transform(haida_gwaii, crs = crs(r_proj))
+
+    # Mask to region (outside will remain NA)
+    r_masked <- mask(r_proj, haida_gwaii_proj)
+
+    # Fill NA inside region only with 0
+    zero_raster <- setValues(r_proj, 0)
+    r_filled <- cover(r_masked, zero_raster)
+
+    # Then mask again to keep NA outside the island
+    r_final <- mask(r_filled, haida_gwaii_proj)
+
+    boundary <- haida_gwaii
+  } else {
+    # Mask to BC (outside will remain NA)
+    r_masked <- mask(r_proj, bc_boundary)
+
+    # Fill NA inside BC only with 0
+    zero_raster <- setValues(r_proj, 0)
+    r_filled <- cover(r_masked, zero_raster)
+
+    # Then mask again to keep NA outside BC
+    r_final <- mask(r_filled, bc_boundary)
+
+    boundary <- bc_boundary
+  }
+
+  # Convert to dataframe
+  r_df <- as.data.frame(r_final, xy = TRUE)
+  colnames(r_df)[3] <- "capability"
+
+  # Remove outside-NA values for plotting
+  r_df <- r_df[!is.na(r_df$capability), ]
+
+  # Auto-zoom logic (optional)
+  xlim <- range(r_df$x)
+  ylim <- range(r_df$y)
+  xpad <- diff(xlim) * 0.05
+  ypad <- diff(ylim) * 0.05
+  zoom_limits <- list(
+    xlim = c(xlim[1] - xpad, xlim[2] + xpad),
+    ylim = c(ylim[1] - ypad, ylim[2] + ypad)
+  )
+
+  # Plot
+  ggplot() +
+    geom_sf(data = boundary, fill = "white", color = "black", size = 0.3) +
+    geom_raster(data = r_df, aes(x = x, y = y, fill = capability)) +
+    scale_fill_viridis(
+      name = "Climate suitability", option = "D",
+      limits = c(0, 1), na.value = "white"
+    ) +
+    coord_sf(
+      crs = st_crs(3005), expand = FALSE,
+      xlim = zoom_limits$xlim, ylim = zoom_limits$ylim
+    ) +
+    labs(title = species_label) +
+    theme_minimal(base_size = 16) +
+    theme(
+      strip.text = element_text(face = "bold", size = 16),
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.title = element_text(hjust = 0.3, size = 16, face = "bold"),
+      legend.position = "none"
+    )
+}
+
+
+# Apply the plotting function
+sdm_plots <- mapply(make_sdm_plot, raster_df$path, raster_df$species_common_name, SIMPLIFY = FALSE)
+
+# Add legend to one plot only
+sdm_plots[[1]] <- sdm_plots[[1]] + theme(legend.position = "right")
+
+# Combine and order plots
+combined_plot <- wrap_plots(sdm_plots, ncol = 5, guides = "collect")
+
+# Save output
+ggsave("Multi_panels/multi_hist_mixbiasedrm2_thinned.jpeg", combined_plot, width = 20, height = 12, dpi = 300)
+```
+
+18.5 Plot the multi panel with MESS rasters shaded in grey
+
+```{r}
+library(raster)
+library(sf)
+library(dplyr)
+library(stringr)
+library(viridis)
+library(ggplot2)
+library(patchwork)
+library(rnaturalearth)
+
+# ================================
+# 1. Raster directory
+# ================================
+raster_dir <- "Output_rasters_maps/SDM_current/Maxent_Bioclim_MixBiased-5_rm2_thinned"
+
+# List raster files
+raster_paths <- list.files(raster_dir, pattern = "\\.tif$", full.names = TRUE)
+
+# Extract scientific names from filenames
+species_sci <- basename(raster_paths) %>%
+  str_remove("_capability_.*\\.tif$") %>%
+  str_replace_all("_", " ")
+
+# Lookup table of scientific to common names
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+
+# Create lookup table
+name_lookup <- data.frame(
+  species = sci_names,
+  species_common_name = common_names,
+  stringsAsFactors = FALSE
+)
+
+# Join raster paths with species names
+raster_df <- data.frame(path = raster_paths, species = species_sci, stringsAsFactors = FALSE) %>%
+  left_join(name_lookup, by = "species") %>%
+  arrange(species_common_name)  # Alphabetical ordering by common name
+
+# Load BC boundary in EPSG:3005
+bc_boundary <- rnaturalearth::ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>%
+  st_transform(3005)
+
+library(ggnewscale)
+
+make_sdm_plot <- function(sdm_path, species_label) {
+
+  # Load SDM raster
+  r_sdm <- raster(sdm_path)
+  
+  # Match mask
+  mask_path <- mask_df$path[mask_df$species == species_label]
+  r_mask <- if(length(mask_path) == 1) raster(mask_path) else NULL
+
+  # Choose boundary
+  boundary <- if(species_label == "Haida ermine") haida_gwaii else bc_boundary
+
+  # Reproject SDM to boundary CRS
+  r_sdm_proj <- projectRaster(r_sdm, crs = st_crs(boundary)$proj4string, method = "bilinear")
+  r_sdm_masked <- mask(r_sdm_proj, boundary)
+  sdm_df <- as.data.frame(r_sdm_masked, xy = TRUE) %>% rename(value = 3)
+  sdm_df <- sdm_df %>% filter(!is.na(value))
+
+  # Mask dataframe
+  if(!is.null(r_mask)) {
+    r_mask_proj <- projectRaster(r_mask, r_sdm_proj, method = "ngb")
+    r_mask_masked <- mask(r_mask_proj, boundary)
+    mask_df_plot <- as.data.frame(r_mask_masked, xy = TRUE) %>%
+      rename(value = 3) %>%
+      filter(value == 1) %>%          # Only pixels masked
+      mutate(plot_type = factor("Not predicted", levels = c("Not predicted")))
+  } else {
+    mask_df_plot <- NULL
+  }
+
+  # Base plot
+  p <- ggplot() +
+    geom_sf(data = boundary, fill = "grey", color = "black", size = 0.3) +
+    geom_tile(data = sdm_df, aes(x = x, y = y, fill = value)) +
+    scale_fill_viridis(name = "Climate suitability", option = "D", limits = c(0, 1), na.value = "white") +
+    ggnewscale::new_scale_fill()
+
+  # Overlay mask
+  if(!is.null(mask_df_plot)) {
+    p <- p +
+      geom_tile(data = mask_df_plot, aes(x = x, y = y, fill = plot_type)) +
+      scale_fill_manual(name = "", values = c("Not predicted" = "grey60"))
+  }
+
+  p <- p +
+    labs(title = species_label) +
+    coord_sf(crs = st_crs(boundary), expand = FALSE) +
+    theme_minimal(base_size = 16) +
+    theme(
+      strip.text = element_text(face = "bold", size = 16),
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.title = element_text(hjust = 0.3, size = 16, face = "bold"),
+      legend.position = "right"
+    )
+
+  return(p)
+}
+
+
+
+# Apply the plotting function
+sdm_plots <- mapply(make_sdm_plot, raster_df$path, raster_df$species_common_name, SIMPLIFY = FALSE)
+
+# Add legend to one plot only
+sdm_plots[[1]] <- sdm_plots[[1]] + theme(legend.position = "right")
+
+# Combine and order plots
+combined_plot <- wrap_plots(sdm_plots, ncol = 5, guides = "collect")
+
+# Save output
+ggsave("Output_multi_panels/Historical_climate_multi/multi_hist_mixbiasedrm2_thinned.jpeg", combined_plot, width = 20, height = 12, dpi = 300)
+
+```
+
+
+
+
+19. Run future climate rasters in a forloop 
+
+```{r}
+# Set folder path
+future_dir <- "Input_GIS/WorldClim_Future"
+
+# List all relevant .tif files
+future_files <- list.files(future_dir, pattern = "\\.tif$", full.names = TRUE)
+
+
+# Function to load and rename bioclim layers
+load_future_bioclim <- function(file_path) {
+  r_stack <- stack(file_path)
+  names(r_stack) <- paste0("bioclim.", 1:nlayers(r_stack))
+  return(r_stack)
+}
+
+# Load and name each stack
+bioclim_245_2021_2040 <- load_future_bioclim(file.path(future_dir, "wc2.1_30s_bioc_BCC-CSM2-MR_ssp245_2021-2040.tif"))
+bioclim_245_2041_2060 <- load_future_bioclim(file.path(future_dir, "wc2.1_30s_bioc_BCC-CSM2-MR_ssp245_2041-2060.tif"))
+bioclim_585_2021_2040 <- load_future_bioclim(file.path(future_dir, "wc2.1_30s_bioc_BCC-CSM2-MR_ssp585_2021-2040.tif"))
+bioclim_585_2041_2060 <- load_future_bioclim(file.path(future_dir, "wc2.1_30s_bioc_BCC-CSM2-MR_ssp585_2041-2060.tif"))
+
+names(bioclim_245_2021_2040)
+
+bioclim_585_2021_2040_resampled <- resample(bioclim_585_2021_2040, ref_layer, method = "bilinear")
+bioclim_585_2041_2060_resampled <- resample(bioclim_585_2041_2060, ref_layer, method = "bilinear")
+bioclim_245_2021_2040_resampled <- resample(bioclim_245_2021_2040, ref_layer, method = "bilinear")
+bioclim_245_2041_2060_resampled <- resample(bioclim_245_2041_2060, ref_layer, method = "bilinear")
+
+bioclim_585_2021_2040_stack <- stack(bioclim_585_2021_2040_resampled)
+bioclim_585_2041_2060_stack <- stack(bioclim_585_2041_2060_resampled)
+bioclim_245_2021_2040_stack <- stack(bioclim_245_2021_2040_resampled)
+bioclim_245_2041_2060_stack <- stack(bioclim_245_2041_2060_resampled)
+
+```
+
+
+20. Create future bioclim rasters
+```{r}
+# ─────────────────────────────────────────────
+# 1. Set raster temp directory
+# ─────────────────────────────────────────────
+raster_tmp <- "temp_raster"
+dir.create(raster_tmp, showWarnings = FALSE, recursive = TRUE)
+raster::rasterOptions(tmpdir = raster_tmp)
+
+# ─────────────────────────────────────────────
+# 2. Define static layers (from current envs)
+# ─────────────────────────────────────────────
+nonbioclim_names <- names(envs_Cl)[!grepl("^bioclim\\.", names(envs_Cl))]
+non_bioclim_unsquared <- subset(envs_Cl, nonbioclim_names)
+
+# ─────────────────────────────────────────────
+# 3. Load & transform regional shapefiles
+# ─────────────────────────────────────────────
+bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>%
+  st_transform(crs(envs_Cl))  # match CRS to rasters
+
+bc_main <- st_read("Input_GIS/BC_mainland.shp") %>% st_transform(st_crs(envs_Cl))
+haida_gwaii <- st_read("Input_GIS/Haida_Gwaii.shp") %>% st_transform(st_crs(envs_Cl))
+van_isle <- st_read("Input_GIS/Vancouver_island.shp") %>% st_transform(st_crs(envs_Cl))
+bc_isle_main <- st_read("Input_GIS/BC_vanisle_main.shp") %>% st_transform(st_crs(envs_Cl))
+
+region_shapefiles <- list(
+  bc_boundary = bc_boundary,
+  bc_main = bc_main,
+  haida_gwaii = haida_gwaii,
+  van_isle = van_isle,
+  bc_isle_main = bc_isle_main
+)
+
+species_region <- c(
+  "Taxidea_taxus" = "bc_main",
+  "Lynx_rufus" = "bc_main",
+  "Vulpes_vulpes" = "bc_main",      
+  "Lynx_canadensis" = "bc_main",
+  "Pekania_pennanti" = "bc_main",
+  "Canis_latrans" = "bc_main",
+  "Martes_spp" = "bc_boundary",
+  "Mustela_haidarum" = "haida_gwaii",
+  "Neogale_vison" = "bc_boundary",
+  "Mustela_nivalis" = "bc_main",
+  "Neogale_frenata" = "bc_main",
+  "Lontra_canadensis" = "bc_boundary",
+  "Procyon_lotor" = "bc_boundary", 
+  "Mephitis_mephitis" = "bc_main",
+  "Spilogale_gracilis" = "bc_main",
+  "Gulo_gulo" = "bc_main",
+  "Mustela_richardsonii" = "bc_isle_main",
+  "Tamiasciurus_hudsonicus" = "bc_main"
+)
+
+# ─────────────────────────────────────────────
+# 4. Define future climate scenarios
+# ─────────────────────────────────────────────
+scenarios <- list(
+  "ssp245_2021_2040" = bioclim_245_2021_2040_stack,
+  "ssp245_2041_2060" = bioclim_245_2041_2060_stack,
+  "ssp585_2021_2040" = bioclim_585_2021_2040_stack,
+  "ssp585_2041_2060" = bioclim_585_2041_2060_stack
+)
+
+# ─────────────────────────────────────────────
+# 5. Project models for each future scenario
+# ─────────────────────────────────────────────
+for (scenario_name in names(scenarios)) {
+  message("\n🌍 Running projections for scenario: ", scenario_name)
+
+  # Combine bioclim + static variables
+  bioclim_stack <- scenarios[[scenario_name]]
+  future_bioclim <- stack(bioclim_stack, non_bioclim_unsquared)
+
+  # Output folder
+  scenario_dir <- file.path("SDM_future", scenario_name)
+  dir.create(scenario_dir, showWarnings = FALSE, recursive = TRUE)
+
+  for (species in names(species_models1)) {
+    message("🔮 Projecting future suitability for: ", species)
+
+    model_Cl <- species_models1[[species]]
+    if (is.null(model_Cl)) {
+      message("⚠ Skipping ", species, ": model missing.")
+      next
+    }
+
+    region_name <- species_region[[species]]
+    region_sf <- region_shapefiles[[region_name]]
+    if (is.null(region_sf)) {
+      message("⚠ Skipping ", species, ": no shapefile for region ", region_name)
+      next
+    }
+
+    # Match future env stack to model input variables
+    matched_envs <- future_bioclim[[names(species_results1[[species]]$bgMask)]]
+    envs_future <- stack(matched_envs)
+
+    tryCatch({
+      # Predict full-BC surface (no cropping)
+      xfer_result <- xfer_time(
+        evalOut = model_Cl,
+        curModel = "fc.LQ_rm.2",
+        envs = envs_future,
+        xfExt = as(extent(envs_future), "SpatialPolygons"),
+        alg = "maxnet",
+        outputType = "logistic",
+        clamp = TRUE
+      )
+
+      pred <- xfer_result$xferTime
+
+      # Mask to species-specific region
+      region_sp <- as_Spatial(region_sf)
+      pred_masked <- mask(pred, region_sp)
+
+      # Fill in NA with 0
+      pred_zeroed <- cover(pred_masked, setValues(pred, 0))
+
+      # Haida ermine: skip BC-wide clipping
+      if (species == "Mustela_haidarum") {
+        pred_final <- pred_zeroed
+      } else {
+        bc_sp <- as_Spatial(region_shapefiles[["bc_boundary"]])
+        pred_final <- mask(pred_zeroed, bc_sp)
+      }
+
+      # Align to template raster
+      template_raster <- raster(region_shapefiles[["bc_boundary"]])
+      res(template_raster) <- res(envs_future)
+      extent(template_raster) <- extent(envs_future)
+      crs(template_raster) <- crs(envs_future)
+
+      final_raster <- raster::resample(pred_final, template_raster, method = "bilinear")
+
+      # Save
+      raster_name <- paste0(species, "_", region_name, "_", scenario_name, ".tif")
+      out_path <- file.path(scenario_dir, raster_name)
+      writeRaster(final_raster, out_path, format = "GTiff", overwrite = TRUE)
+
+      message("✅ Saved: ", out_path)
+
+    }, error = function(e) {
+      message("❌ Error projecting ", species, ": ", conditionMessage(e))
+    })
+  }
+}
+
+message("🎉 All future scenario rasters completed.")
+
+```
+
+
+
+21. Create MESS rasters and apply to existing predictions
+MESS adjust to -5
+```{r}
+rasterOptions(tmpdir = "C:/TempR")
+dir.create("C:/TempR", showWarnings = FALSE)
+
+# ==============================
+# Base paths
+# ==============================
+base_pred_dir <- "SDM_future"
+output_base   <- "SDM_future_MESS_masked_rm2"
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+
+# Historical training environment
+historical_envs <- envs_Cl
+
+# Load best model lookup table
+best_models_df <- read.csv("BestModels_lookup.csv", stringsAsFactors = FALSE)
+
+# ==============================
+# Future climate scenarios
+# ==============================
+scenarios <- list(
+  "ssp245_2021_2040" = bioclim_245_2021_2040_stack,
+  "ssp245_2041_2060" = bioclim_245_2041_2060_stack,
+  "ssp585_2021_2040" = bioclim_585_2021_2040_stack,
+  "ssp585_2041_2060" = bioclim_585_2041_2060_stack
+)
+
+# ==============================
+# Helper functions
+# ==============================
+get_training_vals <- function(species) {
+  coords <- species_results1[[species]]$occurrences[, c("longitude", "latitude")]
+  vals <- raster::extract(historical_envs, coords)
+  vals[complete.cases(vals), ]
+}
+
+convert_model_vars_to_raster_names <- function(vars) {
+  vars <- gsub("^I\\(([^\\)]+)\\^2\\)$", "I.\\1.2.", vars)
+  vars <- gsub("^I\\(([^\\)]+)\\)$", "I.\\1.", vars)
+  vars <- gsub("[()]", "", vars)
+  vars <- gsub(" ", "", vars)
+  vars
+}
+
+add_squared_layers <- function(r_stack, vars) {
+  sq_vars <- grep("^I\\((.*)\\^2\\)$", vars, value = TRUE)
+  for (sq_var in sq_vars) {
+    base_var <- sub("^I\\((.*)\\^2\\)$", "\\1", sq_var)
+    if (!(base_var %in% names(r_stack))) {
+      stop(paste0("Base variable '", base_var, "' not found."))
+    }
+    sq_name <- gsub("^I\\(([^\\)]+)\\^2\\)$", "I.\\1.2.", sq_var)
+    if (!(sq_name %in% names(r_stack))) {
+      sq_layer <- r_stack[[base_var]] * r_stack[[base_var]]
+      names(sq_layer) <- sq_name
+      r_stack <- stack(r_stack, sq_layer)
+    }
+  }
+  return(r_stack)
+}
+
+range_margin <- 0.20
+
+# ==============================
+# Collect all model variables from best models
+# ==============================
+all_model_vars <- unique(unlist(lapply(names(species_models1), function(sp) {
+  bm <- best_models_df[best_models_df$species == sp, ]
+  if (nrow(bm) == 0) return(NULL)
+  model_name <- paste0("fc.", bm$fc[1], "_rm.", bm$rm[1])
+  if (!model_name %in% names(species_models1[[sp]]@models)) return(NULL)
+  names(species_models1[[sp]]@models[[model_name]]$betas)
+})))
+all_model_vars <- all_model_vars[!is.na(all_model_vars)]
+
+# ==============================
+# Main loop over scenarios
+# ==============================
+for (scenario_name in names(scenarios)) {
+  message("\n🌍 Scenario: ", scenario_name)
+
+  scenario_pred_dir   <- file.path(base_pred_dir, scenario_name)
+  scenario_output_dir <- file.path(output_base, scenario_name)
+  dir.create(scenario_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+  future_env_stack <- scenarios[[scenario_name]]
+
+  # Add non-bioclim layers from historical envs if missing
+  nonbioclim_names <- names(envs_Cl)[!grepl("^bioclim\\.", names(envs_Cl))]
+  non_bioclim_unsquared <- subset(envs_Cl, nonbioclim_names)
+
+  missing_nonbioclim <- setdiff(nonbioclim_names, names(future_env_stack))
+  if (length(missing_nonbioclim) > 0) {
+    future_env_stack <- stack(future_env_stack, subset(non_bioclim_unsquared, missing_nonbioclim))
+    message("Added missing non-bioclim layers: ", paste(missing_nonbioclim, collapse = ", "))
+  }
+
+  # Add squared layers needed by models
+  future_env_stack <- add_squared_layers(future_env_stack, all_model_vars)
+
+  # ==============================
+  # Loop over species
+  # ==============================
+  for (species in names(species_models1)) {
+    message("🔬 Processing: ", species)
+
+    # Get best fc/rm for this species
+    bm <- best_models_df[best_models_df$species == species, ]
+    if (nrow(bm) == 0) {
+      message("⚠ Skipping ", species, ": no best model entry in lookup table.")
+      next
+    }
+
+    fc_val <- bm$fc[1]
+    rm_val <- bm$rm[1]
+    model_name <- paste0("fc.", fc_val, "_rm.", rm_val)
+
+    if (!model_name %in% names(species_models1[[species]]@models)) {
+      message("⚠ Skipping ", species, ": model ", model_name, " not found in @models.")
+      next
+    }
+
+    model <- species_models1[[species]]@models[[model_name]]
+
+    # Training values
+    train_vals <- get_training_vals(species)
+    if (nrow(train_vals) < 10) next
+
+    # Match variables
+    model_vars_raw    <- names(model$betas)
+    model_vars_train  <- gsub("^I\\((.*)\\)$", "\\1", model_vars_raw)
+    model_vars_train  <- gsub("[()]", "", model_vars_train)
+    model_vars_raster <- unique(convert_model_vars_to_raster_names(model_vars_raw))
+
+    common_vars_train  <- intersect(model_vars_train, colnames(train_vals))
+    common_vars_raster <- intersect(model_vars_raster, names(future_env_stack))
+    if (length(common_vars_train) < 2 || length(common_vars_raster) < 2) next
+
+    train_vals_sub <- train_vals[, common_vars_train, drop = FALSE]
+    future_envs    <- subset(future_env_stack, common_vars_raster)
+
+    vars_intersect <- intersect(colnames(train_vals_sub), names(future_envs))
+    if (length(vars_intersect) < 2) next
+
+    train_vals_sub <- train_vals_sub[, vars_intersect, drop = FALSE]
+    future_envs    <- subset(future_envs, vars_intersect)
+
+    # Range checks
+    keep_vars <- sapply(vars_intersect, function(var) {
+      train_range <- range(train_vals_sub[, var], na.rm = TRUE)
+      lower <- train_range[1] - range_margin * abs(train_range[1])
+      upper <- train_range[2] + range_margin * abs(train_range[2])
+      future_vals <- getValues(future_envs[[var]])
+      future_vals <- future_vals[!is.na(future_vals)]
+      if (length(future_vals) == 0) return(FALSE)
+      future_min <- suppressWarnings(min(future_vals, na.rm = TRUE))
+      future_max <- suppressWarnings(max(future_vals, na.rm = TRUE))
+      !(future_max < lower || future_min > upper)
+    })
+
+    good_vars <- vars_intersect[keep_vars]
+    if (length(good_vars) < 2) next
+
+    train_vals_sub <- train_vals_sub[, good_vars, drop = FALSE]
+    future_envs    <- subset(future_envs, good_vars)
+
+    # Drop zero-variance variables
+    var_check <- apply(train_vals_sub, 2, var, na.rm = TRUE)
+    good_var_names <- names(var_check[var_check > 0 & !is.na(var_check)])
+    if (length(good_var_names) < 2) next
+
+    train_vals_sub <- train_vals_sub[, good_var_names, drop = FALSE]
+    future_envs    <- subset(future_envs, good_var_names)
+
+    # Align training matrix
+    train_mat <- as.matrix(train_vals_sub)
+    storage.mode(train_mat) <- "double"
+
+    na_only_train <- apply(train_mat, 2, function(x) all(is.na(x)))
+    if (any(na_only_train)) {
+      train_mat   <- train_mat[, !na_only_train, drop = FALSE]
+      future_envs <- subset(future_envs, !na_only_train)
+    }
+
+    all_na <- sapply(1:nlayers(future_envs), function(i) {
+      all(is.na(getValues(future_envs[[i]])))
+    })
+    if (any(all_na)) {
+      future_envs <- future_envs[[!all_na]]
+      train_mat   <- train_mat[, !all_na, drop = FALSE]
+    }
+
+    # ==============================
+    # MESS analysis
+    # ==============================
+    mess_map <- tryCatch({
+      dismo::mess(future_envs, train_mat)
+    }, error = function(e) {
+      message("❌ MESS failed for ", species, ": ", e$message)
+      return(NULL)
+    })
+    if (is.null(mess_map)) next
+
+    # Mask folder
+    mask_dir <- file.path(scenario_output_dir, "Mask")
+    dir.create(mask_dir, showWarnings = FALSE, recursive = TRUE)
+
+    # Save raw MESS raster
+    mess_raw_path <- file.path(mask_dir, paste0(species, "_MESS_raw_", scenario_name, ".tif"))
+    writeRaster(mess_map, mess_raw_path, format = "GTiff", overwrite = TRUE)
+
+    # Save binary MESS mask
+    mess_bin <- mess_map
+    mess_bin[] <- ifelse(mess_map[] < -5, 0, 1)
+    mess_bin_path <- file.path(mask_dir, paste0(species, "_MESS_binary_", scenario_name, ".tif"))
+    writeRaster(mess_bin, mess_bin_path, format = "GTiff", overwrite = TRUE)
+
+    # Apply mask to existing future prediction raster
+    pred_files <- list.files(scenario_pred_dir, pattern = paste0("^", species, ".*\\.tif$"), full.names = TRUE)
+    if (length(pred_files) == 0) next
+    pred_raster <- raster(pred_files[1])
+
+    # Ensure mess_map is on the same grid as pred_raster before masking
+ mess_on_pred <- tryCatch({
+  # project/resample mess_map to pred_raster grid (bilinear ok for continuous MESS)
+  projectRaster(mess_map, to = pred_raster, method = "bilinear", filename = tempfile(fileext = ".tif"))
+}, error = function(e) {
+  message("❌ Failed to reproject MESS to pred grid: ", e$message)
+  return(NULL)
+})
+if (is.null(mess_on_pred)) next
+
+# Create logical mask (TRUE where novel)
+novel_mask <- getValues(mess_on_pred) < -5
+# If you prefer NA instead of 0:
+pred_masked <- pred_raster
+vals <- getValues(pred_masked)
+vals[novel_mask & !is.na(novel_mask)] <- NA      # set masked cells to NA
+pred_masked <- setValues(pred_masked, vals)
+
+# Or to set zero instead:
+# vals[novel_mask & !is.na(novel_mask)] <- 0
+# pred_masked <- setValues(pred_masked, vals)
+
+
+    out_raster_name <- gsub("\\.tif$", "_MESSmasked.tif", basename(pred_files[1]))
+    out_path <- file.path(scenario_output_dir, out_raster_name)
+    writeRaster(pred_masked, out_path, format = "GTiff", overwrite = TRUE)
+
+    message("✅ Saved MESS-masked prediction: ", out_path)
+    message("🧭 Saved MESS raw: ", mess_raw_path)
+    message("📉 Saved MESS binary: ", mess_bin_path)
+
+    rm(pred_raster, mess_map, pred_masked, mess_bin)
+    gc()
+  }
+}
+
+message("\n🎉 All MESS masking complete.")
+
+
+```
+
+22. Create adjusted rasters to more conservative future layers*
+```{r}
+# ------------------------------
+# Conservative future predictions
+# ------------------------------
+rasterOptions(tmpdir = "C:/TempR")
+dir.create("C:/TempR", showWarnings = FALSE)
+
+# Base paths
+base_pred_dir <- "SDM_future"
+output_base   <- "SDM_future_MESS_masked_rm2"
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+
+# Historical training environment
+historical_envs <- envs_Cl
+
+# Load best model lookup table
+best_models_df <- read.csv("BestModels_lookup.csv", stringsAsFactors = FALSE)
+
+# Future climate scenarios
+scenarios <- list(
+  "ssp245_2021_2040" = bioclim_245_2021_2040_stack,
+  "ssp245_2041_2060" = bioclim_245_2041_2060_stack,
+  "ssp585_2021_2040" = bioclim_585_2021_2040_stack,
+  "ssp585_2041_2060" = bioclim_585_2041_2060_stack
+)
+
+# Helper functions
+get_training_vals <- function(species) {
+  coords <- species_results1[[species]]$occurrences[, c("longitude", "latitude")]
+  vals <- raster::extract(historical_envs, coords)
+  vals[complete.cases(vals), ]
+}
+
+convert_model_vars_to_raster_names <- function(vars) {
+  vars <- gsub("^I\\(([^\\)]+)\\^2\\)$", "I.\\1.2.", vars)
+  vars <- gsub("^I\\(([^\\)]+)\\)$", "I.\\1.", vars)
+  vars <- gsub("[()]", "", vars)
+  vars <- gsub(" ", "", vars)
+  vars
+}
+
+add_squared_layers <- function(r_stack, vars) {
+  sq_vars <- grep("^I\\((.*)\\^2\\)$", vars, value = TRUE)
+  for (sq_var in sq_vars) {
+    base_var <- sub("^I\\((.*)\\^2\\)$", "\\1", sq_var)
+    if (!(base_var %in% names(r_stack))) stop(paste0("Base variable '", base_var, "' not found."))
+    sq_name <- gsub("^I\\(([^\\)]+)\\^2\\)$", "I.\\1.2.", sq_var)
+    if (!(sq_name %in% names(r_stack))) {
+      sq_layer <- r_stack[[base_var]] * r_stack[[base_var]]
+      names(sq_layer) <- sq_name
+      r_stack <- stack(r_stack, sq_layer)
+    }
+  }
+  return(r_stack)
+}
+
+# Adjusted range margin
+range_margin <- 5
+
+# Collect all model variables from best models
+all_model_vars <- unique(unlist(lapply(names(species_models1), function(sp) {
+  bm <- best_models_df[best_models_df$species == sp, ]
+  if (nrow(bm) == 0) return(NULL)
+  model_name <- paste0("fc.", bm$fc[1], "_rm.", bm$rm[1])
+  if (!model_name %in% names(species_models1[[sp]]@models)) return(NULL)
+  names(species_models1[[sp]]@models[[model_name]]$betas)
+})))
+all_model_vars <- all_model_vars[!is.na(all_model_vars)]
+
+# Main loop over scenarios
+for (scenario_name in names(scenarios)) {
+  message("\n🌍 Scenario: ", scenario_name)
+
+  scenario_pred_dir   <- file.path(base_pred_dir, scenario_name)
+  scenario_output_dir <- file.path(output_base, scenario_name)
+  dir.create(scenario_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+  future_env_stack <- scenarios[[scenario_name]]
+
+  # Add missing non-bioclim layers
+  nonbioclim_names <- names(envs_Cl)[!grepl("^bioclim\\.", names(envs_Cl))]
+  non_bioclim_unsquared <- subset(envs_Cl, nonbioclim_names)
+  missing_nonbioclim <- setdiff(nonbioclim_names, names(future_env_stack))
+  if (length(missing_nonbioclim) > 0) {
+    future_env_stack <- stack(future_env_stack, subset(non_bioclim_unsquared, missing_nonbioclim))
+    message("Added missing non-bioclim layers: ", paste(missing_nonbioclim, collapse = ", "))
+  }
+
+  # Add squared layers
+  future_env_stack <- add_squared_layers(future_env_stack, all_model_vars)
+
+  # Loop over species
+  for (species in names(species_models1)) {
+    message("🔬 Processing: ", species)
+
+    bm <- best_models_df[best_models_df$species == species, ]
+    if (nrow(bm) == 0) { message("⚠ Skipping ", species); next }
+
+    fc_val <- bm$fc[1]; rm_val <- bm$rm[1]
+    model_name <- paste0("fc.", fc_val, "_rm.", rm_val)
+    if (!model_name %in% names(species_models1[[species]]@models)) {
+      message("⚠ Model ", model_name, " not found for ", species); next
+    }
+
+    model <- species_models1[[species]]@models[[model_name]]
+    train_vals <- get_training_vals(species)
+    if (nrow(train_vals) < 10) next
+
+    # Match variables
+    model_vars_raw    <- names(model$betas)
+    model_vars_train  <- gsub("^I\\((.*)\\)$", "\\1", model_vars_raw)
+    model_vars_train  <- gsub("[()]", "", model_vars_train)
+    model_vars_raster <- unique(convert_model_vars_to_raster_names(model_vars_raw))
+
+    common_vars_train  <- intersect(model_vars_train, colnames(train_vals))
+    common_vars_raster <- intersect(model_vars_raster, names(future_env_stack))
+    if (length(common_vars_train) < 2 || length(common_vars_raster) < 2) next
+
+    train_vals_sub <- train_vals[, common_vars_train, drop = FALSE]
+    future_envs    <- subset(future_env_stack, common_vars_raster)
+
+    vars_intersect <- intersect(colnames(train_vals_sub), names(future_envs))
+    if (length(vars_intersect) < 2) next
+    train_vals_sub <- train_vals_sub[, vars_intersect, drop = FALSE]
+    future_envs    <- subset(future_envs, vars_intersect)
+
+    # Range checks with adjusted margin
+    keep_vars <- sapply(vars_intersect, function(var) {
+      train_range <- range(train_vals_sub[, var], na.rm = TRUE)
+      lower <- train_range[1] - range_margin * abs(train_range[1])
+      upper <- train_range[2] + range_margin * abs(train_range[2])
+      future_vals <- getValues(future_envs[[var]])
+      future_vals <- future_vals[!is.na(future_vals)]
+      if (length(future_vals) == 0) return(FALSE)
+      future_min <- suppressWarnings(min(future_vals, na.rm = TRUE))
+      future_max <- suppressWarnings(max(future_vals, na.rm = TRUE))
+      !(future_max < lower || future_min > upper)
+    })
+
+    good_vars <- vars_intersect[keep_vars]
+    if (length(good_vars) < 2) next
+
+    train_vals_sub <- train_vals_sub[, good_vars, drop = FALSE]
+    future_envs    <- subset(future_envs, good_vars)
+
+    # Drop zero-variance variables
+    var_check <- apply(train_vals_sub, 2, var, na.rm = TRUE)
+    good_var_names <- names(var_check[var_check > 0 & !is.na(var_check)])
+    if (length(good_var_names) < 2) next
+    train_vals_sub <- train_vals_sub[, good_var_names, drop = FALSE]
+    future_envs    <- subset(future_envs, good_var_names)
+
+    # Align training matrix
+    train_mat <- as.matrix(train_vals_sub)
+    storage.mode(train_mat) <- "double"
+
+    na_only_train <- apply(train_mat, 2, function(x) all(is.na(x)))
+    if (any(na_only_train)) {
+      train_mat   <- train_mat[, !na_only_train, drop = FALSE]
+      future_envs <- subset(future_envs, !na_only_train)
+    }
+
+    all_na <- sapply(1:nlayers(future_envs), function(i) all(is.na(getValues(future_envs[[i]]))))
+    if (any(all_na)) {
+      future_envs <- future_envs[[!all_na]]
+      train_mat   <- train_mat[, !all_na, drop = FALSE]
+    }
+
+    # ==============================
+    # MESS analysis
+    # ==============================
+    mess_map <- tryCatch({
+      dismo::mess(future_envs, train_mat)
+    }, error = function(e) { message("❌ MESS failed: ", e$message); return(NULL) })
+    if (is.null(mess_map)) next
+
+    # Save MESS
+    mask_dir <- file.path(scenario_output_dir, "Mask")
+    dir.create(mask_dir, showWarnings = FALSE, recursive = TRUE)
+    mess_raw_path <- file.path(mask_dir, paste0(species, "_MESS_raw_", scenario_name, ".tif"))
+    writeRaster(mess_map, mess_raw_path, format = "GTiff", overwrite = TRUE)
+
+    mess_bin <- mess_map
+    mess_bin[] <- ifelse(mess_map[] < -5, 0, 1)
+    mess_bin_path <- file.path(mask_dir, paste0(species, "_MESS_binary_", scenario_name, ".tif"))
+    writeRaster(mess_bin, mess_bin_path, format = "GTiff", overwrite = TRUE)
+
+    # Apply mask to future prediction raster
+    pred_files <- list.files(scenario_pred_dir, pattern = paste0("^", species, ".*\\.tif$"), full.names = TRUE)
+    if (length(pred_files) == 0) next
+    pred_raster <- raster(pred_files[1])
+
+    # Ensure mess_map is on same grid
+    mess_on_pred <- tryCatch({
+      projectRaster(mess_map, to = pred_raster, method = "bilinear", filename = tempfile(fileext = ".tif"))
+    }, error = function(e) { message("❌ Failed to reproject MESS: ", e$message); return(NULL) })
+    if (is.null(mess_on_pred)) next
+
+    novel_mask <- getValues(mess_on_pred) < -5
+    pred_masked <- pred_raster
+    vals <- getValues(pred_masked)
+    vals[novel_mask & !is.na(novel_mask)] <- NA
+    pred_masked <- setValues(pred_masked, vals)
+
+    out_raster_name <- gsub("\\.tif$", "_MESSmasked.tif", basename(pred_files[1]))
+    out_path <- file.path(scenario_output_dir, out_raster_name)
+    writeRaster(pred_masked, out_path, format = "GTiff", overwrite = TRUE)
+
+    message("✅ Saved MESS-masked prediction: ", out_path)
+    message("🧭 Saved MESS raw: ", mess_raw_path)
+    message("📉 Saved MESS binary: ", mess_bin_path)
+
+    rm(pred_raster, mess_map, pred_masked, mess_bin)
+    gc()
+  }
+}
+
+message("\n🎉 All MESS masking complete.")
+
+```
+
+
+
+23. MESS future raster multi plot
+```{r}
+# ==== Load BC and Haida Gwaii boundaries ====
+bc_boundary <- rnaturalearth::ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>%
+  st_transform(3005)
+
+haida_gwaii <- st_read("Input_GIS/Haida_Gwaii.shp") %>% st_transform(4326)
+
+# ==== Scenario folders ====
+base_dir <- "SDM_future_MESS_masked_rm2"
+scenarios <- list.dirs(base_dir, recursive = FALSE, full.names = FALSE)
+
+# ==== Name lookup ====
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+
+name_lookup <- data.frame(
+  species = sci_names,
+  species_common_name = common_names,
+  stringsAsFactors = FALSE
+)
+
+# ==== Plotting function ====
+make_sdm_plot <- function(rast_path, species_label) {
+  r <- raster(rast_path)
+  r_proj <- projectRaster(r, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+
+  if (species_label == "Haida ermine") {
+    haida_gwaii_proj <- st_transform(haida_gwaii, crs = crs(r_proj))
+    r_masked <- mask(r_proj, haida_gwaii_proj)
+    zero_raster <- setValues(r_proj, 0)
+    r_filled <- cover(r_masked, zero_raster)
+    r_final <- mask(r_filled, haida_gwaii_proj)
+    boundary <- haida_gwaii_proj
+  } else {
+    r_masked <- mask(r_proj, bc_boundary)
+    zero_raster <- setValues(r_proj, 0)
+    r_filled <- cover(r_masked, zero_raster)
+    r_final <- mask(r_filled, bc_boundary)
+    boundary <- bc_boundary
+  }
+
+  r_df <- as.data.frame(r_final, xy = TRUE)
+  colnames(r_df)[3] <- "capability"
+  r_df <- r_df[!is.na(r_df$capability), ]
+
+  xlim <- range(r_df$x); ylim <- range(r_df$y)
+  xpad <- diff(xlim) * 0.05; ypad <- diff(ylim) * 0.05
+
+  ggplot() +
+    geom_sf(data = boundary, fill = "white", color = "black", size = 0.3) +
+    geom_raster(data = r_df, aes(x = x, y = y, fill = capability)) +
+    scale_fill_viridis(name = "Climate suitability", option = "D", limits = c(0, 1), na.value = "white") +
+    coord_sf(crs = st_crs(3005), expand = FALSE,
+             xlim = c(xlim[1] - xpad, xlim[2] + xpad),
+             ylim = c(ylim[1] - ypad, ylim[2] + ypad)) +
+    labs(title = species_label) +
+    theme_minimal(base_size = 16) +
+    theme(
+      strip.text = element_text(face = "bold", size = 16),
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.title = element_text(hjust = 0.3, size = 16, face = "bold"),
+      legend.position = "none"
+    )
+}
+
+# ==== Loop over scenarios ====
+for (scenario in scenarios) {
+  message("📊 Plotting scenario: ", scenario)
+
+  raster_dir <- file.path(base_dir, scenario)
+  raster_paths <- list.files(raster_dir, pattern = "_MESSmasked\\.tif$", full.names = TRUE)
+
+  # Extract species name from filename
+  species_sci <- basename(raster_paths) %>%
+    str_extract("^[^_]+_[^_]+") %>%
+    str_replace_all("_", " ")
+
+  # Join with common names
+  raster_df <- data.frame(path = raster_paths, species = species_sci, stringsAsFactors = FALSE) %>%
+    left_join(name_lookup, by = "species") %>%
+    arrange(species_common_name)
+
+  # Make plots
+  sdm_plots <- mapply(make_sdm_plot, raster_df$path, raster_df$species_common_name, SIMPLIFY = FALSE)
+  sdm_plots[[1]] <- sdm_plots[[1]] + theme(legend.position = "right")
+  combined_plot <- wrap_plots(sdm_plots, ncol = 5, guides = "collect")
+
+  # Save
+  out_path <- file.path("Multi_panels",
+                        paste0("multi_panel_capability_futrm2_", scenario, ".jpeg"))
+  ggsave(out_path, combined_plot, width = 20, height = 12, dpi = 300)
+
+  message("✅ Saved: ", out_path)
+}
+
+```
+
+
+24. Reclassify to include a neutral zone with 10% change on either end:
+```{r}
+# Define directories
+base_future_dir <- "SDM_future_MESS_masked"
+current_dir <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data/3. Maxent/2. HTML_Raster_Maps/SDM_rasters/Maxent_Bioclim_MixBiased-5_rm1"
+output_dir <- "Multi_panels"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Assign each species to a spatial extent
+species_region <- c(
+  "Taxidea_taxus" = "bc_main",
+  "Lynx_rufus" = "bc_main",
+  "Vulpes_vulpes" = "bc_main",      
+  "Lynx_canadensis" = "bc_main",
+  "Pekania_pennanti" = "bc_main",
+  "Canis_latrans" = "bc_main",
+  "Martes_spp" = "bc_boundary",
+  "Mustela_haidarum" = "haida_gwaii",
+  "Neogale_vison" = "bc_boundary",
+  "Mustela_nivalis" = "bc_main",
+  "Neogale_frenata" = "bc_main",
+  "Lontra_canadensis" = "bc_boundary",
+  "Procyon_lotor" = "bc_boundary", 
+  "Mephitis_mephitis" = "bc_main",
+  "Spilogale_gracilis" = "bc_main",
+  "Gulo_gulo" = "bc_main",
+  "Mustela_richardsonii" = "bc_isle_main",
+  "Tamiasciurus_hudsonicus" = "bc_main"
+)
+
+# Define BC Albers projection (EPSG:3005)
+bc_crs <- 3005
+
+# Load and transform BC boundary
+bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>%
+  st_transform(crs = bc_crs)
+
+# Load all regional shapefiles in consistent CRS (3005)
+bc_main        <- st_read("Input_GIS/BC_mainland.shp") %>% st_transform(crs = bc_crs)
+haida_gwaii    <- st_read("Input_GIS/Haida_Gwaii.shp") %>% st_transform(crs = bc_crs)
+van_isle       <- st_read("Input_GIS/Vancouver_island.shp") %>% st_transform(crs = bc_crs)
+bc_isle_main   <- st_read("Input_GIS/BC_vanisle_main.shp") %>% st_transform(crs = bc_crs)
+
+# Store in named list for dynamic access
+region_shapefiles <- list(
+  bc_boundary   = bc_boundary,
+  bc_isle_main  = bc_isle_main,
+  bc_main       = bc_main,
+  haida_gwaii   = haida_gwaii,
+  van_isle      = van_isle
+)
+
+# Optional: if you still want a cropped Haida Gwaii from the BC boundary
+if (!exists("haida_gwaii_crop")) {
+  haida_gwaii_crop <- st_crop(bc_boundary, xmin = -133, xmax = -130, ymin = 52, ymax = 55)
+}
+
+# Name lookup
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+
+name_lookup <- data.frame(
+  species = sci_names,
+  species_common_name = common_names,
+  stringsAsFactors = FALSE
+)
+
+# Helper to extract species names
+extract_species <- function(paths) {
+  sapply(basename(paths), function(fn) {
+    fn <- tools::file_path_sans_ext(fn)
+    parts <- strsplit(fn, "_")[[1]]
+    species <- paste(parts[1:2], collapse = " ")
+    trimws(species)
+  }, USE.NAMES = FALSE) |> as.character()
+}
+
+
+
+# ─────────────────────────────────────────────
+# Plotting function for deltas
+# ─────────────────────────────────────────────
+make_change_plot <- function(path_current, path_future, species_label) {
+  library(raster)
+  library(sf)
+  library(ggplot2)
+  
+  # Define bin thresholds
+  low_thresh <- 0.4
+  high_thresh <- 0.6
+  
+  # Load rasters
+  r_cur <- raster(path_current)
+  r_fut <- raster(path_future)
+  
+  # Reproject and align
+  r_cur <- projectRaster(r_cur, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+  r_fut <- projectRaster(r_fut, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+  r_fut <- resample(r_fut, r_cur, method = "bilinear")
+  
+  # Extract values
+  cur_vals <- r_cur[]
+  fut_vals <- r_fut[]
+  
+  # Bin categories for current and future values
+  bin_class <- function(x) {
+    ifelse(x <= low_thresh, "low",
+           ifelse(x > high_thresh, "high", "moderate"))
+  }
+  cur_bin <- bin_class(cur_vals)
+  fut_bin <- bin_class(fut_vals)
+  
+  # Initialize classification vector
+  r_class_vals <- rep(NA_integer_, length(cur_vals))
+  
+  # Assign categories
+  r_class_vals[cur_bin == "low"      & fut_bin == "low"]      <- 1  # Stable Low
+  r_class_vals[cur_bin == "moderate" & fut_bin == "moderate"] <- 2  # Stable Moderate
+  r_class_vals[cur_bin == "high"     & fut_bin == "high"]     <- 3  # Stable High
+  
+  r_class_vals[(cur_bin %in% c("low", "moderate")) & fut_bin == "high"] <- 4  # Functional Gain
+  r_class_vals[cur_bin %in% c("high", "moderate") & fut_bin == "low"]   <- 5  # Functional Loss
+  
+  r_class_vals[cur_bin == "low"      & fut_bin == "moderate"] <- 6  # Moderate Gain
+  r_class_vals[cur_bin == "high"     & fut_bin == "moderate"] <- 7  # Moderate Decline
+  
+  # Convert to raster
+  r_class <- raster(r_cur)
+  r_class[] <- r_class_vals
+  
+  # Mask by species region
+  if (species_label == "Haida ermine") {
+    boundary <- st_transform(haida_gwaii, 3005)
+  } else {
+    boundary <- bc_boundary
+  }
+  r_final <- mask(r_class, boundary)
+  
+  # Convert to dataframe
+  df <- as.data.frame(r_final, xy = TRUE)
+  colnames(df)[3] <- "change_code"
+  df <- df[!is.na(df$change_code), ]
+  
+  if (nrow(df) == 0) {
+    warning("⚠️ No data for ", species_label, " after masking.")
+    return(NULL)
+  }
+  
+  # Labels and colors
+  df$change_bin <- factor(df$change_code,
+    levels = 1:7,
+    labels = c(
+      "Stable Low (≤0.4)",
+      "Stable Moderate (0.4–0.6)",
+      "Stable High (≥0.6)",
+      "Functional Gain (to high)",
+      "Functional Loss (to low)",
+      "Moderate Gain (to moderate)",
+      "Moderate Decline (to moderate)"
+    )
+  )
+  
+  # Color palette (intuitive & colorblind-friendly)
+  cols <- c(
+    "Stable Low (≤0.4)"           = "grey60",
+    "Stable Moderate (0.4–0.6)"   = "#fee08b",
+    "Stable High (≥0.6)"          = "orange2",
+    "Functional Gain (to high)"   = "#8B1E3F",  # deep red
+    "Functional Loss (to low)"    = "blue4",  # deep blue
+    "Moderate Gain (to moderate)" = "#E7A5AC",
+    "Moderate Decline (to moderate)"   = "turquoise4"
+  )
+  
+  # Extent and padding
+  xlim <- range(df$x); ylim <- range(df$y)
+  xpad <- diff(xlim) * 0.05; ypad <- diff(ylim) * 0.05
+  
+  # Plot
+  ggplot() +
+    geom_sf(data = boundary, fill = "grey95", color = "black", size = 0.3, inherit.aes = FALSE) +
+    geom_raster(data = df, aes(x = x, y = y, fill = change_bin)) +
+    scale_fill_manual(values = cols, na.value = "grey95") +
+    coord_sf(
+      crs = st_crs(3005),
+      xlim = c(xlim[1] - xpad, xlim[2] + xpad),
+      ylim = c(ylim[1] - ypad, ylim[2] + ypad),
+      expand = FALSE
+    ) +
+    labs(
+      title = species_label,
+      fill = "Climate suitability change"
+    ) +
+    theme_void(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+
+
+
+
+# MAIN LOOP
+
+scenario_folders <- list.dirs(base_future_dir, recursive = FALSE, full.names = TRUE)
+
+for (future_dir in scenario_folders) {
+  scen <- basename(future_dir)
+  message("Processing scenario: ", scen)
+
+  # List files
+  cur_paths <- list.files(current_dir, pattern = "\\.tif$", full.names = TRUE)
+  fut_paths <- list.files(future_dir, pattern = "\\.tif$", full.names = TRUE)
+
+  # Build metadata frames
+  current_df <- tibble(
+    path_current = cur_paths,
+    species = extract_species(cur_paths)
+  )
+  future_df <- tibble(
+    path_future = fut_paths,
+    species = extract_species(fut_paths)
+  )
+
+  # Join and match
+  raster_pairs <- inner_join(current_df, future_df, by = "species") %>%
+    left_join(name_lookup, by = "species") %>%
+    arrange(species_common_name)
+
+  if (nrow(raster_pairs) == 0) {
+    warning("  No matched species for ", scen)
+    next
+  }
+# Generate plots
+change_plots <- pmap(
+  raster_pairs,
+  function(path_current, path_future, species, species_common_name) {
+    make_change_plot(path_current, path_future, species_common_name)
+  }
+)
+
+# Remove NULLs
+change_plots <- purrr::compact(change_plots)
+
+if (length(change_plots) > 0) {
+  # Only keep the legend on the first plot
+  change_plots <- map2(change_plots, seq_along(change_plots), function(p, i) {
+    if (i == 1) {
+      p + theme(legend.position = "right")
+    } else {
+      p + theme(legend.position = "none")
+    }
+  })
+
+  # Combine with shared guide
+  combined <- wrap_plots(change_plots, ncol = 5, guides = "collect") & 
+    theme(legend.position = "right")
+
+  out <- file.path(output_dir, paste0("multi_changemess-5_", scen, ".jpeg"))
+  ggsave(out, combined, width = 20, height = 12, dpi = 300)
+  message("✅ Saved to ", out)
+} else {
+  warning("⚠️ No valid plots for ", scen)
+}
+
+
+}
+```
+
+
+
+25. Fixed reclassify to include a neutral zone with 10% change on either end to account for haida gwaii missing, NA values in the MESS mask changed to 0 **
+```{r}
+# -----------------------
+# Directories
+# -----------------------
+base_future_dir <- "SDM_future_MESS_masked_rm1"
+current_dir     <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data/3. Maxent/2. HTML_Raster_Maps/SDM_rasters/Maxent_Bioclim_MixBiased-5_rm2"
+output_dir      <- "Multi_panels"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------
+# Species region lookup (keys use underscores)
+# -----------------------
+species_region <- c(
+  "Taxidea_taxus"       = "bc_main",
+  "Lynx_rufus"          = "bc_main",
+  "Vulpes_vulpes"       = "bc_main",
+  "Lynx_canadensis"     = "bc_main",
+  "Pekania_pennanti"    = "bc_main",
+  "Canis_latrans"       = "bc_main",
+  "Martes_spp"          = "bc_boundary",
+  "Mustela_haidarum"    = "haida_gwaii",
+  "Neogale_vison"       = "bc_boundary",
+  "Mustela_nivalis"     = "bc_main",
+  "Neogale_frenata"     = "bc_main",
+  "Lontra_canadensis"   = "bc_boundary",
+  "Procyon_lotor"       = "bc_boundary",
+  "Mephitis_mephitis"   = "bc_main",
+  "Spilogale_gracilis"  = "bc_main",
+  "Gulo_gulo"           = "bc_main",
+  "Mustela_richardsonii"= "bc_isle_main",
+  "Tamiasciurus_hudsonicus" = "bc_main"
+)
+
+# -----------------------
+# Load boundaries (ensure these paths match your files)
+# -----------------------
+# I use your earlier names and keep them in EPSG:3005; replace paths with yours if needed.
+bc_crs <- 3005
+bc_boundary  <- ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>% st_transform(crs = bc_crs)
+bc_main      <- st_read("Input_GIS/BC_mainland.shp") %>% st_transform(crs = bc_crs)
+haida_gwaii  <- st_read("Input_GIS/Haida_Gwaii.shp") %>% st_transform(crs = bc_crs)
+van_isle     <- st_read("Input_GIS/Vancouver_island.shp") %>% st_transform(crs = bc_crs)
+bc_isle_main <- st_read("Input_GIS/BC_vanisle_main.shp") %>% st_transform(crs = bc_crs)
+
+region_shapefiles <- list(
+  bc_boundary  = bc_boundary,
+  bc_isle_main = bc_isle_main,
+  bc_main      = bc_main,
+  haida_gwaii  = haida_gwaii,
+  van_isle     = van_isle
+)
+
+# -----------------------
+# Name lookup (your original mapping)
+# -----------------------
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+name_lookup <- data.frame(species = sci_names, species_common_name = common_names, stringsAsFactors = FALSE)
+
+# -----------------------
+# Helper: extract species from filename (keeps "Genus species" with a space)
+# -----------------------
+extract_species <- function(paths) {
+  sapply(basename(paths), function(fn) {
+    fn <- tools::file_path_sans_ext(fn)
+    parts <- strsplit(fn, "_")[[1]]
+    species <- paste(parts[1:2], collapse = " ")
+    trimws(species)
+  }, USE.NAMES = FALSE) |> as.character()
+}
+
+# -----------------------
+# make_change_plot: the corrected function
+# -----------------------
+make_change_plot <- function(path_current, path_future, species, species_common_name) {
+  # thresholds
+  low_thresh  <- 0.4
+  high_thresh <- 0.6
+  
+  # load rasters
+  r_cur <- raster(path_current)
+  r_fut <- raster(path_future)
+  
+  # project/resample to BC Albers (EPSG:3005)
+  r_cur <- projectRaster(r_cur, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+  r_fut <- projectRaster(r_fut, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+  r_fut <- resample(r_fut, r_cur, method = "bilinear")
+  
+  # --- Replace MESS/NA with 0 on temporary copies only (so original rasters aren't overwritten) ---
+  r_cur_proc <- r_cur
+  r_fut_proc <- r_fut
+  r_cur_proc[is.na(r_cur_proc[])] <- 0
+  r_fut_proc[is.na(r_fut_proc[])] <- 0
+  
+  # keep pixel values otherwise unchanged — now compute bins from these processed copies
+  bin_class <- function(x) {
+    ifelse(x <= low_thresh, "low",
+           ifelse(x > high_thresh, "high", "moderate"))
+  }
+  cur_bin <- bin_class(r_cur_proc[])
+  fut_bin <- bin_class(r_fut_proc[])
+  
+  # initialize change codes (1..7 as in your original scheme)
+  # 1 = Stable Low (low -> low)
+  # 2 = Stable Moderate (mod -> mod)  <- will be merged with 3 in labels
+  # 3 = Stable High (high -> high)
+  # 4 = Functional Gain (low/mod -> high)
+  # 5 = Functional Loss (high/mod -> low)
+  # 6 = Moderate Gain (low -> moderate)
+  # 7 = Moderate Decline (high -> moderate)
+  r_class_vals <- rep(NA_integer_, length(cur_bin))
+  r_class_vals[cur_bin == "low"      & fut_bin == "low"]      <- 1
+  r_class_vals[cur_bin == "moderate" & fut_bin == "moderate"] <- 2
+  r_class_vals[cur_bin == "high"     & fut_bin == "high"]     <- 3
+  r_class_vals[(cur_bin %in% c("low","moderate")) & fut_bin == "high"] <- 4
+  r_class_vals[cur_bin %in% c("high","moderate") & fut_bin == "low"]   <- 5
+  r_class_vals[cur_bin == "low"      & fut_bin == "moderate"] <- 6
+  r_class_vals[cur_bin == "high"     & fut_bin == "moderate"] <- 7
+  
+  # put codes back into a raster on the original grid
+  r_class <- raster(r_cur)
+  r_class[] <- r_class_vals
+  
+  # -----------------------
+  # Apply regional mask ONLY AT THE END (so pixel nuance is preserved prior to masking)
+  # -----------------------
+  species_key <- gsub(" ", "_", species)         # "Canis latrans" -> "Canis_latrans"
+  region_key  <- species_region[[species_key]]   # may be NULL if not listed
+  if (is.null(region_key) || !(region_key %in% names(region_shapefiles))) {
+    # fallback to bc_boundary if missing
+    message("  (warning) region not found for ", species, " — using bc_boundary")
+    mask_shape <- region_shapefiles$bc_boundary
+  } else {
+    mask_shape <- region_shapefiles[[region_key]]
+  }
+  # ensure mask_shape in same CRS as raster
+  mask_shape <- st_transform(mask_shape, crs = crs(r_class))
+  # convert to Spatial for raster::mask compatibility
+  mask_sp <- tryCatch(as(mask_shape, "Spatial"), error = function(e) {
+    # fallback if conversion fails
+    st_as_sf(mask_shape)
+  })
+  r_final <- mask(r_class, mask_sp)
+  
+  # convert to data.frame for plotting; keep zeros (they're real pixels turned from NA -> 0), drop NA from masking
+  df <- as.data.frame(r_final, xy = TRUE)
+  colnames(df)[3] <- "change_code"
+  df <- df[!is.na(df$change_code), ]   # drop masked-out pixels only
+  if (nrow(df) == 0) {
+    warning("⚠️ No data for ", species_common_name, " after masking.")
+    return(NULL)
+  }
+  
+  # -------------
+  # Remap labels: merge codes 2 & 3 into "Stable suitability"
+  # -------------
+  df$change_bin <- factor(df$change_code,
+    levels = 1:7,
+    labels = c(
+      "Stable Low (≤0.4)",         # code 1
+      "Stable suitability",        # code 2 -> merged
+      "Stable suitability",        # code 3 -> merged
+      "Functional Gain (to high)",# code 4
+      "Functional Loss (to low)", # code 5
+      "Moderate Gain (to moderate)", # code 6
+      "Moderate Decline (to moderate)" # code 7
+    )
+  )
+  
+  # color map — only unique labels matter
+  cols <- c(
+    "Stable Low (≤0.4)"            = "grey60",
+    "Stable suitability"           = "lightyellow2",
+    "Functional Gain (to high)"    = "#8B1E3F",
+    "Functional Loss (to low)"     = "blue4",
+    "Moderate Gain (to moderate)"  = "#E7A5AC",
+    "Moderate Decline (to moderate)" = "turquoise4"
+  )
+  
+  # Choose plot extent:
+  # - Haida ermine -> zoom to haida_gwaii
+  # - Western spotted skunk -> zoom to bc_main (you specified zoomed)
+  # - all others -> full bc_boundary as map extent for context
+  if (!is.null(species_common_name) && tolower(species_common_name) == "haida ermine") {
+    plot_boundary <- st_transform(haida_gwaii, crs = crs(r_class))
+  } else if (!is.null(species_common_name) && tolower(species_common_name) == "western spotted skunk") {
+    plot_boundary <- st_transform(bc_main, crs = crs(r_class))
+  } else {
+    plot_boundary <- st_transform(bc_boundary, crs = crs(r_class))
+  }
+  
+  # axis limits from plot_boundary (adds small padding)
+  bb <- st_bbox(plot_boundary)
+  xpad <- (bb$xmax - bb$xmin) * 0.02
+  ypad <- (bb$ymax - bb$ymin) * 0.02
+  xlim <- c(bb$xmin - xpad, bb$xmax + xpad)
+  ylim <- c(bb$ymin - ypad, bb$ymax + ypad)
+  
+  # Build plot
+  p <- ggplot() +
+    geom_sf(data = plot_boundary, fill = "grey95", color = "black", size = 0.3, inherit.aes = FALSE) +
+    geom_raster(data = df, aes(x = x, y = y, fill = change_bin)) +
+    scale_fill_manual(values = cols, na.value = "grey95", drop = FALSE) +
+    coord_sf(crs = st_crs(3005), xlim = xlim, ylim = ylim, expand = FALSE) +
+    labs(title = species_common_name, fill = "Climate suitability change") +
+    theme_void(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right"
+    )
+  
+  return(p)
+}
+
+# -----------------------
+# MAIN LOOP: iterate scenarios & build multi-panel outputs (same structure you had)
+# -----------------------
+scenario_folders <- list.dirs(base_future_dir, recursive = FALSE, full.names = TRUE)
+
+for (future_dir in scenario_folders) {
+  scen <- basename(future_dir)
+  message("Processing scenario: ", scen)
+  
+  # list rasters
+  cur_paths <- list.files(current_dir, pattern = "\\.tif$", full.names = TRUE)
+  fut_paths <- list.files(future_dir, pattern = "\\.tif$", full.names = TRUE)
+  
+  current_df <- tibble(path_current = cur_paths, species = extract_species(cur_paths))
+  future_df  <- tibble(path_future  = fut_paths, species = extract_species(fut_paths))
+  
+  raster_pairs <- inner_join(current_df, future_df, by = "species") %>%
+    left_join(name_lookup, by = "species") %>%
+    arrange(species_common_name)
+  
+  if (nrow(raster_pairs) == 0) {
+    warning("  No matched species for ", scen)
+    next
+  }
+  
+  # Generate plots (function expects: path_current, path_future, species (sci), species_common_name)
+  change_plots <- pmap(
+    raster_pairs,
+    function(path_current, path_future, species, species_common_name) {
+      tryCatch({
+        make_change_plot(path_current, path_future, species, species_common_name)
+      }, error = function(e) {
+        warning("Error plotting ", species_common_name, ": ", conditionMessage(e))
+        return(NULL)
+      })
+    }
+  )
+  
+  # Remove NULLs
+  change_plots <- purrr::compact(change_plots)
+  
+  if (length(change_plots) > 0) {
+    # Only keep legend on first plot
+    change_plots <- map2(change_plots, seq_along(change_plots), function(p, i) {
+      if (i == 1) p + theme(legend.position = "right") else p + theme(legend.position = "none")
+    })
+    
+    combined <- wrap_plots(change_plots, ncol = 5, guides = "collect") & theme(legend.position = "right")
+    out <- file.path(output_dir, paste0("multi_changemess-5rm2_", scen, ".jpeg"))
+    ggsave(out, combined, width = 20, height = 12, dpi = 300)
+    message("✅ Saved to ", out)
+  } else {
+    warning("⚠️ No valid plots for ", scen)
+  }
+}
+
+```
+
+
+
+26. Bins for richness map (gain/stable/loss multi panel across species)
+```{r}
+# ─────────────────────────────────────────────────────
+# Species Richness Change Map Script (Gain/Stable/Loss)
+# ─────────────────────────────────────────────────────
+# Define directories
+base_future_dir <- "SDM_future_MESS_masked_rm2"
+current_dir <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data/3. Maxent/2. HTML_Raster_Maps/SDM_rasters/Maxent_Bioclim_MixBiased-5_rm2"
+output_dir <- "Multi_panels"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Define BC Albers projection
+bc_crs <- 3005
+
+# Load and transform BC boundary
+bc_boundary <- ne_states(country = "Canada", returnclass = "sf") %>%
+  filter(name == "British Columbia") %>%
+  st_transform(crs = bc_crs)
+
+# Species name lookup
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+
+name_lookup <- data.frame(
+  species = sci_names,
+  species_common_name = common_names,
+  stringsAsFactors = FALSE
+)
+
+# Helper to extract species names from filenames
+extract_species <- function(paths) {
+  sapply(basename(paths), function(fn) {
+    fn <- tools::file_path_sans_ext(fn)
+    parts <- strsplit(fn, "_")[[1]]
+    species <- paste(parts[1:2], collapse = " ")
+    trimws(species)
+  }, USE.NAMES = FALSE) |> as.character()
+}
+
+# ─────────────────────────────────────────────
+# Main Loop Over Climate Scenarios
+# ─────────────────────────────────────────────
+
+scenario_folders <- list.dirs(base_future_dir, recursive = FALSE, full.names = TRUE)
+
+for (future_dir in scenario_folders) {
+  scen <- basename(future_dir)
+  message("🔄 Processing scenario: ", scen)
+
+  # Match rasters
+  cur_paths <- list.files(current_dir, pattern = "\\.tif$", full.names = TRUE)
+  fut_paths <- list.files(future_dir, pattern = "\\.tif$", full.names = TRUE)
+
+  current_df <- tibble(path_current = cur_paths, species = extract_species(cur_paths))
+  future_df <- tibble(path_future = fut_paths, species = extract_species(fut_paths))
+
+  raster_pairs <- inner_join(current_df, future_df, by = "species") %>%
+    left_join(name_lookup, by = "species") %>%
+    arrange(species_common_name)
+
+  if (nrow(raster_pairs) == 0) {
+    warning("⚠️ No matched species for ", scen)
+    next
+  }
+
+  # Prepare storage for gain/loss/stable rasters
+  gain_list <- list()
+  loss_list <- list()
+  stable_list <- list()
+
+  for (i in seq_len(nrow(raster_pairs))) {
+    row <- raster_pairs[i, ]
+    r_cur <- raster(row$path_current)
+    r_fut <- raster(row$path_future)
+
+    # Reproject to BC Albers (EPSG:3005)
+    r_cur <- projectRaster(r_cur, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+    r_fut <- projectRaster(r_fut, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+
+    # Align resolution and extent
+    r_fut <- resample(r_fut, r_cur, method = "bilinear")
+
+    # Binary threshold
+    r_cur_bin <- r_cur >= 0.4
+    r_fut_bin <- r_fut >= 0.4
+
+    # Classify gain/loss/stable
+    r_gain <- (r_cur_bin == 0) & (r_fut_bin == 1)
+    r_loss <- (r_cur_bin == 1) & (r_fut_bin == 0)
+    r_stable <- (r_cur_bin == 1) & (r_fut_bin == 1)
+
+    # Store as numeric rasters
+    gain_list[[i]] <- mask(r_gain * 1, bc_boundary)
+    loss_list[[i]] <- mask(r_loss * 1, bc_boundary)
+    stable_list[[i]] <- mask(r_stable * 1, bc_boundary)
+  }
+
+  # Sum richness across species
+  gain_rich <- calc(stack(gain_list), sum, na.rm = TRUE)
+  loss_rich <- calc(stack(loss_list), sum, na.rm = TRUE)
+  stable_rich <- calc(stack(stable_list), sum, na.rm = TRUE)
+
+  # Convert to data frames for plotting
+  gain_df <- as.data.frame(gain_rich, xy = TRUE) %>% mutate(class = "Gain")
+  loss_df <- as.data.frame(loss_rich, xy = TRUE) %>% mutate(class = "Loss")
+  stable_df <- as.data.frame(stable_rich, xy = TRUE) %>% mutate(class = "Stable")
+
+  richness_df <- bind_rows(gain_df, loss_df, stable_df) %>%
+    rename(richness = 3) %>%
+    filter(!is.na(richness) & richness > 0)
+
+ # Relabel and relevel facet order
+richness_df <- bind_rows(gain_df, loss_df, stable_df) %>%
+  rename(richness = 3) %>%
+  filter(!is.na(richness) & richness > 0) %>%
+  mutate(class = recode(class,
+                        "Gain" = "Net Gain",
+                        "Stable" = "Net Stable",
+                        "Loss" = "Net Decrease"),
+         class = factor(class, levels = c("Net Gain", "Net Stable", "Net Decrease")))
+
+# Plot
+p <- ggplot(richness_df, aes(x = x, y = y, fill = richness)) +
+  geom_raster() +
+  facet_wrap(~class, ncol = 3) +  # Horizontal layout
+  scale_fill_viridis_c(option = "D", name = "Species Richness") +
+  geom_sf(data = bc_boundary, fill = NA, color = "black", size = 0.2, inherit.aes = FALSE) +
+  coord_sf(crs = st_crs(3005)) +
+  theme_void(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold", size = 14),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+p
+
+# Save
+out_path <- file.path(output_dir, paste0("richness_rm2_", scen, ".jpeg"))
+ggsave(out_path, plot = p, width = 14, height = 5, dpi = 300)
+message("✅ Saved richness map to: ", out_path)
+}
+
+```
+
+
+27. This is a 40-60 Climate suitability threshold version *Adjusted plot to match the map scheme*
+```{r}
+# ─────────────────────────────────────
+# Setup
+# ─────────────────────────────────────
+# Directories
+current_dir <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data/3. Maxent/2. HTML_Raster_Maps/SDM_rasters/Maxent_Bioclim_MixBiased-5_rm2"
+base_future_dir <- "SDM_future_MESS_masked_rm2"
+output_dir <- "Habitat_change_graphs"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Threshold for Climate suitability
+capability_threshold <- 0.5
+
+# Species name lookup
+sci_names <- c(
+  "Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+  "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+  "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+  "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes"
+)
+common_names <- c(
+  "Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+  "Western spotted skunk", "American badger", "Red fox"
+)
+name_lookup <- data.frame(
+  species = sci_names,
+  species_common_name = common_names,
+  stringsAsFactors = FALSE
+)
+
+# Extract species from filenames
+extract_species <- function(paths) {
+  sapply(basename(paths), function(fn) {
+    fn <- tools::file_path_sans_ext(fn)
+    parts <- strsplit(fn, "_")[[1]]
+    species <- paste(parts[1:2], collapse = " ")
+    trimws(species)
+  }, USE.NAMES = FALSE)
+}
+
+# Format scenario names nicely
+format_scenario_title <- function(scen_code) {
+  parts <- strsplit(scen_code, "_")[[1]]
+  ssp <- parts[1]
+  years <- paste0(parts[2], "–", parts[3])
+
+  label <- dplyr::case_when(
+    ssp == "ssp245" ~ "SSP 245 (Business as usual)",
+    ssp == "ssp585" ~ "SSP 585 (Worst-case scenario)",
+    TRUE ~ toupper(ssp)
+  )
+
+  return(paste0(label, ", ", years))
+}
+
+# ─────────────────────────────────────
+# Function to calculate % change in suitable climate
+# ─────────────────────────────────────
+calculate_percent_change_nuanced <- function(path_current, path_future, species_label) {
+  r_cur <- raster(path_current)
+  r_fut <- raster(path_future)
+
+  # Project to BC Albers
+  r_cur <- projectRaster(r_cur, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+  r_fut <- projectRaster(r_fut, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+
+  # Align rasters
+  r_fut <- resample(r_fut, r_cur, method = "bilinear")
+
+  # Pixel size in ha
+  pixel_area_ha <- res(r_cur)[1] * res(r_cur)[2] / 10000
+
+  # Extract values
+  cur_vals <- getValues(r_cur)
+  fut_vals <- getValues(r_fut)
+
+  # Treat NA as 0
+  cur_vals[is.na(cur_vals)] <- 0
+  fut_vals[is.na(fut_vals)] <- 0
+
+  # Classify suitability
+  classify <- function(x) {
+    dplyr::case_when(
+      x < 0.4 ~ "Low",
+      x <= 0.6 ~ "Moderate",
+      TRUE ~ "High"
+    )
+  }
+
+  cur_class <- classify(cur_vals)
+  fut_class <- classify(fut_vals)
+
+  # Combine into transitions
+  transitions <- paste(cur_class, fut_class, sep = "_to_")
+
+  # Filter out Low_to_Low (not capable in either time)
+  keep <- !(transitions == "Low_to_Low")
+  transitions <- transitions[keep]
+  cur_class <- cur_class[keep]
+  fut_class <- fut_class[keep]
+
+  # Map transitions to categories (NO Stable Low)
+  change_type <- dplyr::case_when(
+    transitions %in% c("High_to_High", "Moderate_to_Moderate") ~ "Stable",
+    transitions == "Moderate_to_High" ~ "Stable",
+    transitions == "High_to_Moderate" ~ "Stable",
+    transitions == "Moderate_to_Low" ~ "Moderate loss",
+    transitions == "High_to_Low" ~ "High loss",
+    transitions == "Low_to_Moderate" ~ "New moderate",
+    transitions == "Low_to_High" ~ "New high",
+    TRUE ~ NA_character_
+  )
+
+  df <- tibble::tibble(change_type) %>%
+    dplyr::count(change_type, name = "pixels") %>%
+    dplyr::mutate(
+      area_ha = pixels * pixel_area_ha,
+      species = species_label
+    )
+
+  # Total current suitable climate = Moderate + High
+  cur_capable <- cur_class %in% c("Moderate", "High")
+  A_current <- sum(cur_capable) * pixel_area_ha
+
+  # Total future suitable climate = Moderate + High
+  fut_capable <- fut_class %in% c("Moderate", "High")
+  A_future <- sum(fut_capable) * pixel_area_ha
+
+  df <- df %>%
+    dplyr::mutate(
+      percent_of_current = (area_ha / A_current) * 100,
+      current_area_ha = A_current,
+      future_area_ha = A_future
+    ) %>%
+    dplyr::filter(!is.na(change_type))
+
+  return(df)
+}
+
+## ─────────────────────────────────────
+# Loop over future scenarios
+# ─────────────────────────────────────
+scenario_folders <- list.dirs(base_future_dir, recursive = FALSE, full.names = TRUE)
+
+for (future_dir in scenario_folders) {
+  scen <- basename(future_dir)
+  scenario_title <- format_scenario_title(scen)
+  message("📊 Processing scenario: ", scenario_title)
+
+  # List raster paths
+  cur_paths <- list.files(current_dir, pattern = "\\.tif$", full.names = TRUE)
+  fut_paths <- list.files(future_dir, pattern = "\\.tif$", full.names = TRUE)
+
+  current_df <- tibble::tibble(
+    path_current = cur_paths,
+    species = extract_species(cur_paths)
+  )
+  future_df <- tibble::tibble(
+    path_future = fut_paths,
+    species = extract_species(fut_paths)
+  )
+
+  # Match files
+  raster_pairs <- dplyr::inner_join(current_df, future_df, by = "species") %>%
+    dplyr::left_join(name_lookup, by = "species")
+
+  # Calculate % changes for each matched pair
+  change_summary <- purrr::pmap_dfr(
+    raster_pairs,
+    function(path_current, path_future, species, species_common_name) {
+      calculate_percent_change_nuanced(path_current, path_future, species)
+    }
+  )
+
+  # Merge in common names
+  change_summary <- change_summary %>%
+    dplyr::left_join(name_lookup, by = "species")
+
+  # Force inclusion of all species in lookup
+  change_summary <- change_summary %>%
+    tidyr::complete(
+      species_common_name = name_lookup$species_common_name,
+      change_type = c("Stable", "Moderate loss", "High loss", "New moderate", "New high"),
+      fill = list(percent_of_current = 0, area_ha = 0, pixels = 0,
+                  current_area_ha = 0, future_area_ha = 0)
+    )
+
+  # Summarise net change per species
+  species_wide <- change_summary %>%
+    dplyr::select(species_common_name, change_type, percent_of_current,
+                  current_area_ha, future_area_ha) %>%
+    tidyr::pivot_wider(names_from = change_type, values_from = percent_of_current, values_fill = 0) %>%
+    dplyr::group_by(species_common_name, current_area_ha, future_area_ha) %>%
+    dplyr::summarise(
+      Gain = sum(`New moderate`) + sum(`New high`),
+      Loss = sum(`Moderate loss`) + sum(`High loss`),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      net_diff = Gain - Loss,
+      net_change_class = dplyr::case_when(
+        net_diff > 20 ~ "Net gain",
+        net_diff < -20 ~ "Net loss",
+        TRUE ~ "Neutral"
+      ),
+      net_change_class = factor(net_change_class, levels = c("Net gain", "Neutral", "Net loss"))
+    )
+
+  # Save table with current & future area
+  readr::write_csv(species_wide, file.path(output_dir, paste0("summary_table_", scen, ".csv")))
+
+  # Plot setup
+  change_summary2 <- change_summary %>%
+    dplyr::left_join(species_wide %>% dplyr::select(species_common_name, net_change_class, Gain),
+              by = "species_common_name") %>%
+    dplyr::group_by(net_change_class) %>%
+    dplyr::mutate(
+      species_common_name = forcats::fct_reorder(species_common_name, Gain, .desc = FALSE)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      species_common_name = droplevels(species_common_name),
+      change_type = factor(
+        change_type,
+        levels = c("New high", "New moderate", "High loss", "Moderate loss", "Stable")
+      )
+    )
+
+  # Plot
+  percent_plot <- ggplot2::ggplot(change_summary2, aes(x = species_common_name, y = percent_of_current, fill = change_type)) +
+    ggplot2::geom_col(position = "stack") +
+    ggplot2::coord_flip() +
+    ggplot2::facet_grid(net_change_class ~ ., scales = "free_y", space = "free_y") +
+    ggplot2::scale_fill_manual(
+      name = "Change in suitable climate area",
+      values = c(
+        "Stable" = "#fee08b",
+        "Moderate loss" = "turquoise4",
+        "High loss" = "blue4",
+        "New moderate" = "#E7A5AC",
+        "New high" = "#8B1E3F"
+      )
+    ) +
+    ggplot2::labs(
+      title = paste("% Change in suitable climate\n", scenario_title),
+      x = "Species",
+      y = "Percent of current suitable climate area"
+    ) +
+    ggplot2::theme_classic(base_size = 18) +
+    ggplot2::theme(
+      axis.text = element_text(size = 16),
+      axis.title = element_text(size = 18),
+      plot.title = element_text(size = 20, face = "bold"),
+      legend.title = element_text(size = 17),
+      legend.text = element_text(size = 15),
+      strip.background = element_rect(fill = "grey90", color = "grey40"),
+      strip.text = element_text(size = 18, face = "bold", color = "black"),
+      strip.placement = "top",
+      strip.text.y.left = element_text(angle = 0)
+    )
+
+  # Save plot
+  ggsave(
+    filename = file.path(output_dir, paste0("bias_phabitat_changerm2_", scen, ".png")),
+    plot = percent_plot,
+    width = 16,
+    height = 9,
+    dpi = 300,
+    bg = "white"
+  )
+}
+
+
+```
+
+
+28. Create a summary figure across scenarios for net gain and net loss
+
+```{r}
+# ─────────────────────────────────────
+# Script: Line Plot of Net Change in suitable climate
+# Summary: Calculates and visualizes net % change in suitable climate across climate scenarios
+# ─────────────────────────────────────
+
+# Load libraries
+library(tidyverse)
+library(raster)
+library(forcats)
+library(tidyr)
+library(purrr)
+library(tools)
+library(fs)
+
+# ─────────────────────────────────────
+# Setup
+# ─────────────────────────────────────
+current_dir <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data/3. Maxent/2. HTML_Raster_Maps/SDM_rasters/Maxent_Bioclim_MixBiased-5_rm2"
+base_future_dir <- "SDM_future_MESS_masked_rm2"
+output_dir <- "Habitat_change_graphs"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Species name lookup
+sci_names <- c("Canis latrans", "Gulo gulo", "Lontra canadensis", "Lynx canadensis", "Lynx rufus",
+               "Martes spp", "Mephitis mephitis", "Mustela richardsonii", "Mustela haidarum",
+               "Mustela nivalis", "Neogale frenata", "Neogale vison", "Pekania pennanti", "Procyon lotor",
+               "Spilogale gracilis", "Taxidea taxus", "Vulpes vulpes")
+common_names <- c("Coyote", "Wolverine", "North American river otter", "Canada lynx", "Bobcat",
+                  "Martens", "Striped skunk", "Short-tailed weasel", "Haida ermine",
+                  "Least weasel", "Long-tailed weasel", "American mink", "Fisher", "Raccoon",
+                  "Western spotted skunk", "American badger", "Red fox")
+name_lookup <- data.frame(species = sci_names, species_common_name = common_names, stringsAsFactors = FALSE)
+
+extract_species <- function(paths) {
+  sapply(basename(paths), function(fn) {
+    fn <- file_path_sans_ext(fn)
+    parts <- strsplit(fn, "_")[[1]]
+    species <- paste(parts[1:2], collapse = " ")
+    trimws(species)
+  }, USE.NAMES = FALSE)
+}
+
+format_scenario_title <- function(scen_code) {
+  parts <- strsplit(scen_code, "_")[[1]]
+  ssp <- parts[1]
+  years <- paste0(parts[2], "–", parts[3])
+  label <- case_when(
+    ssp == "ssp245" ~ "SSP 245 (Business as usual)",
+    ssp == "ssp585" ~ "SSP 585 (Worst-case scenario)",
+    TRUE ~ toupper(ssp)
+  )
+  paste0(label, ", ", years)
+}
+
+calculate_percent_change_nuanced <- function(path_current, path_future, species_label) {
+  r_cur <- raster(path_current)
+  r_fut <- raster(path_future)
+  r_cur <- projectRaster(r_cur, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+  r_fut <- projectRaster(r_fut, crs = CRS("+init=EPSG:3005"), method = "bilinear")
+  r_fut <- resample(r_fut, r_cur, method = "bilinear")
+  pixel_area_ha <- res(r_cur)[1] * res(r_cur)[2] / 10000
+  cur_vals <- getValues(r_cur)
+  fut_vals <- getValues(r_fut)
+  valid <- !is.na(cur_vals) & !is.na(fut_vals)
+  cur_vals <- cur_vals[valid]
+  fut_vals <- fut_vals[valid]
+  classify <- function(x) case_when(
+    x < 0.4 ~ "Low",
+    x <= 0.6 ~ "Moderate",
+    TRUE ~ "High"
+  )
+  cur_class <- classify(cur_vals)
+  fut_class <- classify(fut_vals)
+  transitions <- paste(cur_class, fut_class, sep = "_to_")
+  keep <- !(transitions == "Low_to_Low")
+  transitions <- transitions[keep]
+  change_type <- case_when(
+    transitions %in% c("High_to_High", "Moderate_to_Moderate") ~ "Stable",
+    transitions %in% c("Moderate_to_High", "High_to_Moderate") ~ "Stable",
+    transitions == "Moderate_to_Low" ~ "Moderate loss",
+    transitions == "High_to_Low" ~ "High loss",
+    transitions == "Low_to_Moderate" ~ "New moderate",
+    transitions == "Low_to_High" ~ "New high",
+    TRUE ~ NA_character_
+  )
+  df <- tibble(change_type) %>% count(change_type, name = "pixels") %>%
+    mutate(area_ha = pixels * pixel_area_ha, species = species_label)
+  cur_capable <- cur_class[keep] %in% c("Moderate", "High")
+  A_current <- sum(cur_capable) * pixel_area_ha
+  df <- df %>% mutate(percent_of_current = (area_ha / A_current) * 100) %>% filter(!is.na(change_type))
+  return(df)
+}
+
+# ─────────────────────────────────────
+# Loop over scenarios to build net % change summary
+# ─────────────────────────────────────
+scenario_folders <- list.dirs(base_future_dir, recursive = FALSE, full.names = TRUE)
+all_species_wide <- list()
+
+for (future_dir in scenario_folders) {
+  scen <- basename(future_dir)
+  scenario_title <- format_scenario_title(scen)
+  message("Processing ", scenario_title)
+
+  cur_paths <- list.files(current_dir, pattern = "\\.tif$", full.names = TRUE)
+  fut_paths <- list.files(future_dir, pattern = "\\.tif$", full.names = TRUE)
+
+  current_df <- tibble(path_current = cur_paths, species = extract_species(cur_paths))
+  future_df <- tibble(path_future = fut_paths, species = extract_species(fut_paths))
+
+  raster_pairs <- inner_join(current_df, future_df, by = "species") %>%
+    left_join(name_lookup, by = "species")
+
+  change_summary <- pmap_dfr(
+    raster_pairs,
+    function(path_current, path_future, species, species_common_name) {
+      calculate_percent_change_nuanced(path_current, path_future, species)
+    }
+  ) %>% left_join(name_lookup, by = "species")
+
+  change_summary <- change_summary %>%
+    complete(
+      species_common_name = unique(change_summary$species_common_name),
+      change_type = c("Stable", "Moderate loss", "High loss", "New moderate", "New high"),
+      fill = list(percent_of_current = 0)
+    )
+
+  species_wide <- change_summary %>%
+    pivot_wider(names_from = change_type, values_from = percent_of_current, values_fill = 0) %>%
+    group_by(species_common_name) %>%
+    summarise(
+      Gain = `New moderate` + `New high`,
+      Loss = `Moderate loss` + `High loss`
+    ) %>%
+    ungroup() %>%
+    mutate(
+      net_diff = Gain - Loss,
+      net_change_class = case_when(
+        net_diff > 10 ~ "Net gain",
+        net_diff < -10 ~ "Net loss",
+        TRUE ~ "Neutral"
+      ),
+      scenario = scenario_title
+    )
+
+  all_species_wide[[scen]] <- species_wide
+}
+
+# ─────────────────────────────────────
+# Plot: Net % Change Line Plot Across Scenarios
+# ─────────────────────────────────────
+species_trends <- bind_rows(all_species_wide)
+
+
+# Mapping from long to short scenario names
+scenario_map <- c(
+  "SSP 245 (Business as usual), 2021–2040" = "SSP 245 2021–40",
+  "SSP 585 (Worst-case scenario), 2021–2040" = "SSP 585 2021–40",
+  "SSP 245 (Business as usual), 2041–2060" = "SSP 245 2041–60",
+  "SSP 585 (Worst-case scenario), 2041–2060" = "SSP 585 2041–60"
+)
+
+# Add a new column with short names and factor it with the desired order
+species_trends <- species_trends %>%
+  mutate(
+    scenario_short = recode(scenario, !!!scenario_map),
+    scenario_short = factor(scenario_short, levels = c(
+      "SSP 245 2021–40",
+      "SSP 585 2021–40",
+      "SSP 245 2041–60",
+      "SSP 585 2041–60"
+    ))
+  )
+
+# Filter out Neutral and plot using scenario_short on x-axis
+species_trends_filtered <- species_trends %>%
+  filter(net_change_class != "Neutral")
+
+# Reshape data for grouped bar plot
+species_trends_long <- species_trends %>%
+  select(species_common_name, scenario_short, Gain, Loss) %>%
+  pivot_longer(cols = c(Gain, Loss), names_to = "ChangeType", values_to = "PercentChange")
+
+# Plot: Grouped Bar Plot
+net_change_barplot <- ggplot(species_trends_long,
+                             aes(x = scenario_short, y = PercentChange, fill = ChangeType)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.6) +
+  facet_wrap(~species_common_name, ncol = 4, scales = "free_y") +
+  scale_fill_manual(
+    name = "Change type",
+    values = c("Gain" = "#8B1E3F", "Loss" = "blue4")
+  ) +
+  labs(
+    title = "Gain and loss in suitable climate area across climate scenarios",
+    subtitle = "Bar height shows % change in suitable climate (suitability > 0.4) relative to current",
+    x = "Scenario",
+    y = "% change in suitable climate"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    strip.text = element_text(size = 11, face = "bold"),
+    legend.position = "bottom",
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 13)
+  )
+
+# Save the plot
+ggsave(
+  filename = file.path(output_dir, "grouped_barplot_net_gain_loss.png"),
+  plot = net_change_barplot,
+  width = 14,
+  height = 10,
+  dpi = 300,
+  bg = "white"
+)
+
+
+
+write.csv(species_trends, file.path(output_dir, "species_trends_net_change.csv"), row.names = FALSE)
+
+```
+
+
+
